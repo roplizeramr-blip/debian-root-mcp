@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.auth import RemoteAuthProvider
+from fastmcp.server.auth import AuthContext, RemoteAuthProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from pydantic import AnyHttpUrl
 from starlette.responses import JSONResponse
@@ -54,6 +54,11 @@ auth = SupabaseMCPAuth(
     base_url=BASE_URL,
 )
 mcp = FastMCP("Debian noVNC and FreeRADIUS Admin", auth=auth)
+
+def require_supabase_oauth(ctx: AuthContext) -> bool:
+    """Reject ordinary Supabase sessions; only OAuth-issued access tokens carry client_id."""
+    token = ctx.token
+    return bool(token and token.claims.get("sub") and token.claims.get("client_id"))
 
 AUDIT_FILE = Path("/var/log/debian-root-mcp/audit.jsonl")
 FR_ROOT = Path("/etc/freeradius/3.0")
