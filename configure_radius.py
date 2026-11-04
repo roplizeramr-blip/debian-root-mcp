@@ -195,7 +195,7 @@ def main() -> int:
     for block in ("authorize", "accounting", "post-auth"):
         payload = (
             "update control {\n"
-            f'    REST-HTTP-Header := "x-radius-key: {secret}"\n'
+            f'    &REST-HTTP-Header := "x-radius-key: {secret}"\n'
             "}\n"
             "rest"
         )
