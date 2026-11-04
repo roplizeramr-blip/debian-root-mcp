@@ -27,6 +27,19 @@ else
     echo "RADIUS_API_URL/RADIUS_API_KEY not configured; FreeRADIUS remains disabled."
 fi
 
+# Portwarp state is persisted on the /root/.portwarp CranL volume.
+# Once the owner has approved pwrp login and created UDP tunnels, reconnect
+# all enabled tunnels on every container start. A missing login/tunnel is
+# non-fatal and must never take down the dashboard or FreeRADIUS.
+if command -v pwrp >/dev/null 2>&1 && [[ -n "$RADIUS_PID" ]]; then
+    install -d -m 0700 /root/.portwarp
+    if pwrp connect --all --save --detach; then
+        echo "Portwarp tunnel connection requested."
+    else
+        echo "Portwarp is not configured yet; run 'pwrp login' and create the UDP tunnels." >&2
+    fi
+fi
+
 /dockerstartup/startup.sh &
 DESKTOP_PID=$!
 
@@ -37,6 +50,7 @@ cleanup() {
         fi
     done
 }
+
 trap cleanup EXIT INT TERM
 
 # MCP is the required long-running process. Desktop startup helpers may exit
