@@ -8,8 +8,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      nginx python3 python3-venv python3-pip ca-certificates \
+      nginx python3 python3-venv python3-pip ca-certificates curl tar \
       freeradius freeradius-rest freeradius-utils \
+    && curl -fsSL https://portwarp.com/download/install.sh | bash \
+    && pwrp version \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/debian-root-mcp
