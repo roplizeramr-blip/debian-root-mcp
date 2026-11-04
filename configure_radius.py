@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import grp
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import sys
 import urllib.error
@@ -18,6 +20,16 @@ API_KEY = os.environ.get("RADIUS_API_KEY", "").strip()
 
 def q(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "").replace("\r", "") + '"'
+
+
+def secure_freeradius_path(path: Path, mode: int) -> None:
+    path.chmod(mode)
+    try:
+        uid = pwd.getpwnam("freerad").pw_uid
+        gid = grp.getgrnam("freerad").gr_gid
+        os.chown(path, uid, gid)
+    except KeyError as exc:
+        raise RuntimeError("freerad service account is missing") from exc
 
 
 def api_post(op: str, data: dict | None = None):
@@ -46,48 +58,128 @@ def managed_clients() -> None:
     rows = api_post("nas.radius-clients")
     if not isinstance(rows, list):
         raise RuntimeError("NAS API returned an invalid payload")
+
     directory = BASE / "clients.d"
     directory.mkdir(mode=0o750, parents=True, exist_ok=True)
-    blocks = []
-    count = 0
+    secure_freeradius_path(directory, 0o750)
+
+    loopback = ipaddress.ip_network("127.0.0.0/8")
+    portwarp_network = ipaddress.ip_network("127.0.0.1/32")
+    portwarp_rows: list[dict] = []
+    direct_blocks: list[str] = []
+    direct_networks: list[tuple[ipaddress.IPv4Network, str]] = []
+    direct_count = 0
+
     for row in rows:
         raw_addr = str(row.get("nasname") or "").strip()
         short = str(row.get("shortname") or "nas").strip()
         secret = str(row.get("secret") or "")
         kind = str(row.get("type") or "other").lower()
-        if not raw_addr or len(secret) < 24:
-            continue
+
+        if not raw_addr:
+            raise RuntimeError(f"NAS '{short}' has no source address")
+        if len(secret) < 32:
+            raise RuntimeError(f"NAS '{short}' has a Shared Secret shorter than 32 characters")
+
         try:
             network = ipaddress.ip_network(raw_addr, strict=False)
-        except ValueError:
-            print(f"Skipping NAS with non-IP address: {short}", file=sys.stderr)
-            continue
+        except ValueError as exc:
+            raise RuntimeError(f"NAS '{short}' must use a valid IPv4 address or CIDR") from exc
+
         if network.version != 4:
+            raise RuntimeError(f"NAS '{short}' must use IPv4")
+
+        if network.overlaps(loopback):
+            if network != portwarp_network:
+                raise RuntimeError("Portwarp NAS must use exactly 127.0.0.1/32; other loopback ranges are not allowed")
+            portwarp_rows.append(row)
             continue
+
+        for previous_network, previous_name in direct_networks:
+            if network.overlaps(previous_network):
+                raise RuntimeError(
+                    f"NAS '{short}' source range {network} overlaps NAS '{previous_name}' ({previous_network})"
+                )
+        direct_networks.append((network, short))
+
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", short)[:48] or "nas"
         safe_type = "mikrotik" if kind == "mikrotik" else "other"
         address = network.with_prefixlen if network.prefixlen < 32 else network.network_address.compressed
-        blocks.extend([
+        direct_blocks.extend([
             f"client {safe_name}_{row.get('id', 0)} {{",
             f"    ipaddr = {address}",
+            "    proto = udp",
             f"    secret = {q(secret)}",
-            f"    shortname = {safe_name}",
+            f"    shortname = {q(safe_name)}",
             f"    nastype = {safe_type}",
+            "    require_message_authenticator = yes",
+            "    limit_proxy_state = yes",
             "}",
             "",
         ])
-        count += 1
+        direct_count += 1
+
+    if len(portwarp_rows) > 1:
+        raise RuntimeError(
+            "Only one NAS may use 127.0.0.1 for the current Portwarp ingress. "
+            "Routers behind the same tunnel share one RADIUS client secret."
+        )
+
     target = directory / "radius-managed.conf"
     temporary = target.with_suffix(".conf.tmp")
-    temporary.write_text("\n".join(blocks), encoding="utf-8")
+    temporary.write_text("\n".join(direct_blocks), encoding="utf-8")
     temporary.chmod(0o640)
     temporary.replace(target)
+    secure_freeradius_path(target, 0o640)
+
     clients_conf = BASE / "clients.conf"
     content = clients_conf.read_text(encoding="utf-8")
     include = "$INCLUDE clients.d/radius-managed.conf"
     if include not in content:
-        clients_conf.write_text(content.rstrip() + "\n\n" + include + "\n", encoding="utf-8")
-    print(f"Loaded {count} IPv4 NAS clients.")
+        content = content.rstrip() + "\n\n" + include + "\n"
+
+    local_pattern = re.compile(r"(?ms)^client localhost\s*\{.*?^\}")
+    local_match = local_pattern.search(content)
+    if not local_match:
+        raise RuntimeError("Default FreeRADIUS client localhost block was not found")
+
+    if portwarp_rows:
+        row = portwarp_rows[0]
+        local_secret = str(row.get("secret") or "")
+        local_name = re.sub(
+            r"[^A-Za-z0-9_.-]", "_", str(row.get("shortname") or "mikrotik-portwarp")
+        )[:48] or "mikrotik-portwarp"
+    else:
+        # No Portwarp NAS is registered: make the loopback client unusable from
+        # an unregistered public tunnel, while keeping the FreeRADIUS config valid.
+        seed = os.environ.get("MCP_JWT_SECRET", "").encode() + b":radius-disabled-portwarp"
+        local_secret = hashlib.sha256(seed).hexdigest()
+        local_name = "disabled-portwarp-ingress"
+
+    local_block = "\n".join([
+        "client localhost {",
+        "    ipaddr = 127.0.0.1",
+        "    proto = udp",
+        f"    secret = {q(local_secret)}",
+        f"    shortname = {q(local_name)}",
+        "    nastype = mikrotik",
+        "    require_message_authenticator = yes",
+        "    limit_proxy_state = yes",
+        "}",
+    ])
+    content = content[:local_match.start()] + local_block + content[local_match.end():]
+
+    temporary_clients = clients_conf.with_suffix(".conf.tmp")
+    temporary_clients.write_text(content, encoding="utf-8")
+    temporary_clients.chmod(0o640)
+    temporary_clients.replace(clients_conf)
+    secure_freeradius_path(clients_conf, 0o640)
+
+    print(
+        f"Loaded {direct_count} direct IPv4 NAS client(s) and "
+        f"{len(portwarp_rows)} Portwarp ingress client(s)."
+    )
+
 
 
 def insert_in_block(text: str, block_name: str, payload: str) -> str:
