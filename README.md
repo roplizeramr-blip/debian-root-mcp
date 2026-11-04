@@ -1,41 +1,51 @@
-# Debian noVNC + FreeRADIUS MCP
+# Debian noVNC + Root MCP
 
-OAuth-protected MCP administration for the existing Debian/noVNC container.
+Self-hosted OAuth 2.1 authorization server and MCP resource server running inside the existing Debian/noVNC container. No Supabase, external identity provider, static bearer token, or Docker socket is required.
+
+## Endpoints
+
+- MCP Streamable HTTP: `https://YOUR-APP-DOMAIN/mcp`
+- OAuth authorization server metadata: `/.well-known/oauth-authorization-server`
+- Protected resource metadata: `/.well-known/oauth-protected-resource/mcp`
+- Authorization endpoint: `/authorize`
+- Token endpoint: `/token`
+- Consent screen: `/oauth/consent` (opened automatically during OAuth; a direct visit without a pending transaction is expected to expire)
+- noVNC remains at `/`
 
 ## Authentication
-- Supabase Auth is the OAuth 2.1 authorization server.
-- FastMCP SupabaseProvider verifies Supabase JWTs and publishes MCP protected-resource metadata.
-- Authorization Code + PKCE and refresh tokens are handled by Supabase Auth.
-- Consent UI: `/oauth/callback`. No static MCP bearer token is used.
 
-## Required environment
-- `SUPABASE_PROJECT_URL=https://wloqbuigxcbcxprmnyjq.supabase.co`
+- OAuth 2.1 Authorization Code grant with PKCE S256.
+- ChatGPT Client ID Metadata Documents (CIMD); client metadata is fetched from an allowlisted `chatgpt.com` URL.
+- The token endpoint supports `private_key_jwt` and public-client `none` authentication.
+- Access tokens are signed JWTs with an exact issuer, MCP resource audience, client ID, subject, scope, expiry, and token ID.
+- Required scope: `debian.root`. Refresh tokens are issued for reconnects.
+- Consent requires a separate Debian MCP administrator account. This account is not the Linux root password.
+
+## Required environment variables
+
+Configure these through the hosting platform's secret/environment settings. Never commit credentials:
+
 - `MCP_BASE_URL=https://YOUR-APP-DOMAIN`
-- `SUPABASE_JWT_ALGORITHM=ES256` (must match Supabase Auth signing key)
+- `MCP_ADMIN_USERNAME`
+- `MCP_ADMIN_PASSWORD_HASH`: PBKDF2-SHA256 encoded value in the form `pbkdf2_sha256$iterations$salt_hex$digest_hex`
+- `MCP_JWT_SECRET`: random secret of at least 64 characters
 
-The publishable key is public and embedded in `oauth-consent.html`. Never put a Supabase secret/service-role key in browser code.
+The raw administrator password is used only at the consent form and is not stored by the app; only its PBKDF2 hash is stored in the environment.
 
-## Supabase Dashboard setup
-1. Authentication → OAuth Server → enable OAuth Server.
-2. Enable Dynamic OAuth Apps / Dynamic Client Registration.
-3. Set Site URL to `https://YOUR-APP-DOMAIN`.
-4. Set Authorization Path to `/oauth/callback`.
-5. Use an asymmetric JWT signing key (ES256 or RS256) and set the matching algorithm.
-6. Create the owner account under Authentication → Users, then disable public sign-ups. Consent UI supports sign-in only.
-7. Verify discovery at `https://wloqbuigxcbcxprmnyjq.supabase.co/.well-known/oauth-authorization-server/auth/v1`.
+## MCP tools
 
-## MCP endpoint
-`https://YOUR-APP-DOMAIN/mcp`. Add as a custom MCP server in ChatGPT and choose OAuth.
+- `system_overview`: Debian version, kernel, uptime, memory, storage, hostname, and active users.
+- `root_shell`: run a Bash command as root inside the Debian container. The first call returns a preview; execution requires `confirm_execution=true`.
+- `root_read_file`: read regular files inside the container as root.
+- `root_write_file`: atomically write files inside the container as root. The first call previews the change; commit requires `confirm_write=true`. Existing files receive a one-time `.mcp.bak` backup.
+- `root_list_directory`: list directories and optional descendants.
+- `service_control`: systemd service start/stop/restart/reload/enable/disable/status.
+- `read_service_logs`: read a service's recent journal logs.
 
-## Tools
-- `system_overview`
-- `service_status`, `service_control` (FreeRADIUS and Nginx only)
-- `freeradius_config_test`, `nginx_config_test`
-- `list_config_files`, `read_config_file`, `write_config_file`
-- `read_service_logs`
+These privileges apply to the Debian container only, not the hosting provider's underlying host.
 
-Writes are limited to .conf files in `/etc/freeradius/3.0` and `/etc/nginx/conf.d`, atomic, size-limited and backed up once. There is no arbitrary shell execution, unrestricted file write, or Docker socket access.
+## Audit and operation
 
-Audit records contain metadata only at `/var/log/debian-root-mcp/audit.jsonl`; tokens and config contents are never logged.
+Metadata-only audit events are written to `/var/log/debian-root-mcp/audit.jsonl`. Passwords, bearer tokens, and file contents are not written to the audit log. MCP listens on loopback port 8765 behind Nginx on port 6901; noVNC remains on its original internal port 6902.
 
-noVNC remains at `/`; MCP uses `/mcp`; OAuth consent uses `/oauth/callback`. Nginx listens on 6901.
+The MCP server uses in-memory authorization transactions and revocation state. A container redeploy or restart may require the user to authorize again; do not assume in-memory revocation state survives a restart.
