@@ -27,6 +27,7 @@ from starlette.routing import Route
 from uvicorn import run as uvicorn_run
 
 from mcp.server import MCPServer
+from mcp.server.auth.handlers.authorize import AuthorizationHandler
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
