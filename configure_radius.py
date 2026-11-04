@@ -280,7 +280,7 @@ def main() -> int:
 '''
     module = BASE / "mods-available" / "rest"
     module.write_text(module_text, encoding="utf-8")
-    module.chmod(0o640)
+    secure_freeradius_path(module, 0o640)
     enabled = BASE / "mods-enabled" / "rest"
     if not enabled.exists():
         enabled.symlink_to("../mods-available/rest")
@@ -295,6 +295,7 @@ def main() -> int:
         )
         site = insert_in_block(site, block, payload)
     site_path.write_text(site, encoding="utf-8")
+    secure_freeradius_path(site_path, 0o640)
     clients_conf = BASE / "clients.conf"
     if clients_conf.exists():
         local_seed = os.environ.get("MCP_JWT_SECRET", "").encode() + b":radius-local-client"
