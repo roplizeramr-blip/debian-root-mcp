@@ -5,7 +5,7 @@ Self-hosted OAuth 2.1 authorization server and MCP resource server running insid
 ## Endpoints
 
 - MCP Streamable HTTP transport: `https://YOUR-APP-DOMAIN/mcp`
-- Canonical OAuth resource identifier (RFC 8707): `https://YOUR-APP-DOMAIN` (origin, with no `/mcp` suffix; this matches ChatGPT's resource indicator)
+- Canonical OAuth resource identifier (RFC 8707): `https://YOUR-APP-DOMAIN/` (normalized origin, with a trailing slash and no `/mcp` suffix; this exactly matches the published resource metadata)
 - Protected resource metadata: `/.well-known/oauth-protected-resource` (root discovery path; the document's `resource` is the origin above)
 - OAuth authorization server metadata: `/.well-known/oauth-authorization-server`
 - Protected resource metadata: `/.well-known/oauth-protected-resource/mcp`
