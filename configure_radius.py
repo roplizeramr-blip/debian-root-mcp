@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -35,7 +36,8 @@ def api_post(op: str, data: dict | None = None):
                 raise RuntimeError(str(payload["error"]))
             return payload
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"RADIUS API returned HTTP {exc.code}") from exc
+        detail = exc.read(2000).decode("utf-8", "replace")
+        raise RuntimeError(f"RADIUS API returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"RADIUS API unreachable: {exc.reason}") from exc
 
@@ -201,6 +203,13 @@ def main() -> int:
         )
         site = insert_in_block(site, block, payload)
     site_path.write_text(site, encoding="utf-8")
+    clients_conf = BASE / "clients.conf"
+    if clients_conf.exists():
+        local_seed = os.environ.get("MCP_JWT_SECRET", "").encode() + b":radius-local-client"
+        local_secret = hashlib.sha256(local_seed).hexdigest()
+        local_text = clients_conf.read_text(encoding="utf-8").replace("secret = testing123", "secret = " + q(local_secret))
+        clients_conf.write_text(local_text, encoding="utf-8")
+
     managed_clients()
     print("FreeRADIUS REST authorize/accounting/post-auth configured.")
     return 0
