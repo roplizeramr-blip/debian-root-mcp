@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import os
 import re
+import signal
+import subprocess
+import sys
 import time
 from typing import Any
 
@@ -214,14 +218,149 @@ async def api_plans(request: Request) -> Response:
     return await _proxy(request, "plans.create", write=True, roles=("super_admin", "network_owner"))
 
 
+def _nas_sync_worker() -> dict[str, Any]:
+    """Regenerate, validate and reload the FreeRADIUS client list.
+
+    Changes are rolled back if generation or validation fails. A NAS DB write
+    is not rolled back here; the API response clearly reports a sync failure.
+    """
+    script = Path("/opt/debian-root-mcp/configure_radius.py")
+    if not script.is_file():
+        return {"ok": False, "error": "configure_radius.py was not found"}
+
+    base = Path("/etc/freeradius/3.0")
+    site_default = (base / "sites-enabled" / "default").resolve()
+    snapshot_paths = [
+        base / "clients.conf",
+        base / "clients.d" / "radius-managed.conf",
+        base / "mods-available" / "rest",
+        site_default,
+    ]
+    snapshots: dict[str, bytes | None] = {}
+    modes: dict[str, int] = {}
+    for path in snapshot_paths:
+        key = str(path)
+        snapshots[key] = path.read_bytes() if path.is_file() else None
+        if path.exists():
+            modes[key] = path.stat().st_mode & 0o777
+
+    try:
+        setup = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env=os.environ.copy(),
+            check=False,
+        )
+        if setup.returncode != 0:
+            detail = (setup.stderr or setup.stdout or "NAS configuration generation failed")[-1800:]
+            raise RuntimeError(detail)
+
+        check = subprocess.run(
+            ["freeradius", "-XC"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=os.environ.copy(),
+            check=False,
+        )
+        if check.returncode != 0:
+            detail = (check.stderr or check.stdout or "Unknown FreeRADIUS validation error")[-1800:]
+            raise RuntimeError("FreeRADIUS validation failed: " + detail)
+
+        finder = subprocess.run(
+            ["pgrep", "-xo", "freeradius"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        pid_text = finder.stdout.strip()
+        if finder.returncode != 0 or not pid_text.isdigit():
+            raise RuntimeError("Configuration is valid, but the FreeRADIUS process was not found")
+
+        os.kill(int(pid_text), signal.SIGHUP)
+        return {
+            "ok": True,
+            "message": "NAS records synchronized; FreeRADIUS configuration validated and reloaded.",
+            "generator": (setup.stdout or "").strip()[-500:],
+            "validation": "Configuration appears to be OK",
+        }
+    except Exception as exc:
+        rollback_errors = []
+        for path in snapshot_paths:
+            key = str(path)
+            old = snapshots.get(key)
+            try:
+                if old is None:
+                    if path.exists():
+                        path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_name(path.name + ".rollback")
+                    temporary.write_bytes(old)
+                    temporary.replace(path)
+                    path.chmod(modes.get(key, 0o640))
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc)[:180])
+        message = str(exc)[:1600]
+        if rollback_errors:
+            message += " | rollback warning: " + "; ".join(rollback_errors)
+        return {
+            "ok": False,
+            "error": message,
+            "message": "NAS data may be saved, but FreeRADIUS was not reloaded.",
+        }
+
+
+async def _nas_mutation(request: Request, operation: str) -> Response:
+    claims, error = _authorized(request, True, ("super_admin", "network_owner"))
+    if error:
+        return error
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            return _json({"error": "JSON object required"}, 400)
+    except Exception:
+        return _json({"error": "Invalid JSON body"}, 400)
+
+    if claims.get("role") != "super_admin":
+        tenant_id = claims.get("tenant_id")
+        if not tenant_id:
+            return _json({"error": "A network must be selected for this NAS"}, 400)
+        data["tenant_id"] = tenant_id
+
+    payload, status = await _edge(operation, data)
+    if status >= 400:
+        return _json(payload, status)
+
+    sync = await asyncio.to_thread(_nas_sync_worker)
+    result = dict(payload) if isinstance(payload, dict) else {"result": payload}
+    result["radius_sync"] = sync
+    return _json(result, 200)
+
+
 async def api_nas(request: Request) -> Response:
     if request.method == "GET":
         return await _proxy(request, "nas.list", roles=("super_admin", "network_owner", "support"))
-    return await _proxy(request, "nas.create", write=True, roles=("super_admin", "network_owner"))
+    return await _nas_mutation(request, "nas.create")
+
+
+async def api_nas_update(request: Request) -> Response:
+    return await _nas_mutation(request, "nas.update")
 
 
 async def api_nas_delete(request: Request) -> Response:
-    return await _proxy(request, "nas.delete", write=True, roles=("super_admin", "network_owner"))
+    return await _nas_mutation(request, "nas.delete")
+
+
+async def api_nas_sync(request: Request) -> Response:
+    claims, error = _authorized(request, True, ("super_admin", "network_owner"))
+    if error:
+        return error
+    sync = await asyncio.to_thread(_nas_sync_worker)
+    return _json(sync, 200 if sync.get("ok") else 503)
 
 
 async def api_sessions(request: Request) -> Response:
@@ -334,7 +473,23 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charse
 <section id="operators" class="section"><div class="panel"><div class="panelhead"><div><h2>حسابات الإدارة</h2><p>أصحاب الشبكات، المشرفون، الموزعون، والعملاء</p></div><button class="btn primary" data-action="new-operator">＋ حساب جديد</button></div><div class="tablewrap"><table><thead><tr><th>اسم الدخول</th><th>الاسم</th><th>الدور</th><th>الشبكة</th><th>البريد</th><th>الحالة</th><th>آخر دخول</th></tr></thead><tbody id="operatorsTable"><tr><td class="empty" colspan="6">جارٍ التحميل</td></tr></tbody></table></div></div></section>
 <section id="users" class="section"><div class="panel"><div class="panelhead"><div><h2>مشتركو الإنترنت</h2><p>الاشتراكات، الماك، الأجهزة، وتحديد السرعة</p></div><button class="btn primary" data-action="new-user">＋ مشترك جديد</button></div><div class="tablewrap"><table><thead><tr><th>المستخدم</th><th>الاسم</th><th>الباقة</th><th>تنزيل / رفع</th><th>الحالة</th><th>الأجهزة</th><th>الانتهاء</th><th>إجراء</th></tr></thead><tbody id="usersTable"><tr><td class="empty" colspan="8">جارٍ التحميل</td></tr></tbody></table></div></div></section>
 <section id="plans" class="section"><div class="panel"><div class="panelhead"><div><h2>الباقات والسرعات</h2><p>سرعة التنزيل والرفع والحصة الشهرية والمهلة</p></div><button class="btn primary" data-action="new-plan">＋ باقة جديدة</button></div><div class="tablewrap"><table><thead><tr><th>الباقة</th><th>تنزيل</th><th>رفع</th><th>الحصة</th><th>مدة الجلسة</th><th>السعر</th><th>الحالة</th></tr></thead><tbody id="plansTable"><tr><td class="empty" colspan="7">جارٍ التحميل</td></tr></tbody></table></div></div></section>
-<section id="nas" class="section"><div class="panel"><div class="panelhead"><div><h2>أجهزة NAS / MikroTik</h2><p>إدارة عناوين الأجهزة وRADIUS Shared Secret</p></div><button class="btn primary" data-action="new-nas">＋ إضافة NAS</button></div><div class="tablewrap"><table><thead><tr><th>IP / DNS</th><th>الاسم</th><th>النوع</th><th>الوصف</th><th>إجراء</th></tr></thead><tbody id="nasTable"><tr><td class="empty" colspan="5">جارٍ التحميل</td></tr></tbody></table></div></div></section>
+<section id="nas" class="section">
+<div class="panel">
+  <div class="panelhead">
+    <div><h2>أجهزة NAS / MikroTik</h2><p>تسجيل عملاء RADIUS وإدارة المفاتيح ومزامنة FreeRADIUS</p></div>
+    <div class="quick"><button class="btn" type="button" onclick="syncNas()">↻ مزامنة وفحص RADIUS</button><button class="btn primary" data-action="new-nas">＋ إضافة NAS</button></div>
+  </div>
+  <div id="nasSyncStatus" class="statusbox" style="margin-bottom:14px">لم يتم فحص مزامنة NAS في هذه الجلسة.</div>
+  <div class="tablewrap"><table><thead><tr><th>طريقة الاتصال</th><th>عنوان المصدر على السيرفر</th><th>اسم الجهاز</th><th>النوع</th><th>Shared Secret</th><th>الوصف</th><th>الإجراء</th></tr></thead>
+  <tbody id="nasTable"><tr><td class="empty" colspan="7">جارٍ التحميل</td></tr></tbody></table></div>
+</div>
+<div class="panel">
+  <h2>قواعد تعريف NAS حسب طريقة الاتصال</h2>
+  <div class="note"><b>Portwarp UDP:</b> يصل الطلب إلى FreeRADIUS من المصدر المحلي <code>127.0.0.1</code>، لذلك يُنشأ تعريف RADIUS client واحد فقط لهذا النفق. أجهزة MikroTik التي تمر عبر نفس نقطة الدخول تستخدم Shared Secret واحدًا. يمكن تمييزها منطقيًا باستخدام <code>NAS-Identifier</code>، لكنه لا ينشئ أسرار عميل مستقلة.</div>
+  <div class="note" style="margin-top:10px"><b>الاتصال المباشر:</b> أدخل عنوان المصدر أو CIDR الذي يصل فعليًا إلى FreeRADIUS بعد NAT، وليس عنوان LAN للراوتر إذا كان المصدر يتغير عند العبور.</div>
+  <div class="note" style="margin-top:10px">تمنع اللوحة تكرار عنوان Portwarp وتداخل نطاقات IPv4 حتى لا يختار FreeRADIUS تعريف عميل غير مقصود.</div>
+</div>
+</section>
 <section id="resellers" class="section"><div class="panel"><div class="panelhead"><div><h2>الموزعون والمحافظ</h2><p>العمولات والرصيد وحدود الائتمان</p></div><button class="btn primary" data-action="new-reseller">＋ موزع جديد</button></div><div class="tablewrap"><table><thead><tr><th>الموزع</th><th>الكود</th><th>العمولة</th><th>الرصيد</th><th>الحد الائتماني</th><th>الحالة</th></tr></thead><tbody id="resellersTable"><tr><td class="empty" colspan="6">جارٍ التحميل</td></tr></tbody></table></div></div><div class="panel"><div class="panelhead"><h2>حركة المحافظ</h2></div><div class="tablewrap"><table><thead><tr><th>الموزع</th><th>النوع</th><th>المبلغ</th><th>الرصيد بعد العملية</th><th>التوقيت</th></tr></thead><tbody id="walletTable"><tr><td class="empty" colspan="5">جارٍ التحميل</td></tr></tbody></table></div></div></section>
 <section id="vouchers" class="section"><div class="panel"><div class="panelhead"><div><h2>كروت الشحن</h2><p>دفعات كروت، أكواد فريدة، طباعة وتوزيع</p></div><button class="btn primary" data-action="new-voucher">＋ إصدار دفعة كروت</button></div><div class="tablewrap"><table><thead><tr><th>الكود</th><th>آخر 4 من PIN</th><th>الباقة</th><th>القيمة</th><th>الحالة</th><th>التاريخ</th></tr></thead><tbody id="vouchersTable"><tr><td class="empty" colspan="6">جارٍ التحميل</td></tr></tbody></table></div></div></section>
 <section id="sales" class="section"><div class="panel"><div class="panelhead"><div><h2>المبيعات والتحصيل</h2><p>عمليات بيع الكروت والعمولات وطرق الدفع</p></div></div><div class="tablewrap"><table><thead><tr><th>رقم العملية</th><th>الموزع</th><th>المستخدم</th><th>الإجمالي</th><th>العمولة</th><th>طريقة الدفع</th><th>الحالة</th><th>التاريخ</th></tr></thead><tbody id="salesTable"><tr><td class="empty" colspan="8">جارٍ التحميل</td></tr></tbody></table></div></div></section>
@@ -348,7 +503,17 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charse
 </main></div>
 <dialog id="userModal" class="modal"><form id="userForm"><h3>إضافة / تعديل مشترك</h3><div class="formgrid"><div class="field"><label>اسم المستخدم *</label><input name="username" required minlength="3"></div><div class="field"><label>كلمة المرور *</label><input name="password" type="password" required minlength="8"></div><div class="field"><label>الاسم</label><input name="display_name"></div><div class="field"><label>الهاتف</label><input name="phone"></div><div class="field"><label>البريد</label><input name="email" type="email"></div><div class="field"><label>الباقة</label><select name="plan_id" id="userPlan"></select></div><div class="field"><label>MAC Binding (اختياري)</label><input name="mac_address" placeholder="AA:BB:CC:DD:EE:FF"></div><div class="field"><label>أقصى أجهزة متزامنة</label><input type="number" name="max_devices" min="1" max="100" value="1"></div><div class="field"><label>Tenant UUID (للأدمن الأعلى)</label><input name="tenant_id" placeholder="معرّف الشبكة"></div><div class="field full"><label>انتهاء الاشتراك</label><input type="datetime-local" name="expires_at"></div></div><div class="modalfoot"><button class="btn primary" type="submit">حفظ المشترك</button><button class="btn" type="button" onclick="closeModal('userModal')">إلغاء</button></div></form></dialog>
 <dialog id="planModal" class="modal"><form id="planForm"><h3>إنشاء باقة</h3><div class="formgrid"><div class="field full"><label>اسم الباقة</label><input name="name" required></div><div class="field"><label>تنزيل Mbps</label><input type="number" name="download_mbps" min="1" value="4" required></div><div class="field"><label>رفع Mbps</label><input type="number" name="upload_mbps" min="1" value="4" required></div><div class="field"><label>الحصة MB</label><input type="number" name="quota_mb" min="1"></div><div class="field"><label>Session Timeout (ثانية)</label><input type="number" name="session_timeout" min="1"></div><div class="field"><label>السعر EGP</label><input type="number" name="price" min="0" step=".01" value="0"></div><div class="field full"><label>الوصف</label><input name="description"></div><div class="field full"><label>Tenant UUID (للأدمن الأعلى)</label><input name="tenant_id" placeholder="معرّف الشبكة"></div></div><div class="modalfoot"><button class="btn primary" type="submit">حفظ الباقة</button><button class="btn" type="button" onclick="closeModal('planModal')">إلغاء</button></div></form></dialog>
-<dialog id="nasModal" class="modal"><form id="nasForm"><h3>إضافة جهاز NAS</h3><div class="formgrid"><div class="field"><label>IP أو DNS</label><input name="nasname" required placeholder="192.168.88.1"></div><div class="field"><label>الاسم</label><input name="shortname" required placeholder="router-01"></div><div class="field"><label>النوع</label><select name="type"><option value="mikrotik">MikroTik</option><option value="wireless">Wireless</option><option value="other">Other</option></select></div><div class="field"><label>RADIUS Shared Secret</label><input name="secret" minlength="24" required></div><div class="field full"><label>الوصف</label><input name="description"></div><div class="field full"><label>Tenant UUID (للأدمن الأعلى)</label><input name="tenant_id" placeholder="معرّف الشبكة"></div></div><div class="modalfoot"><button class="btn primary" type="submit">حفظ NAS</button><button class="btn" type="button" onclick="closeModal('nasModal')">إلغاء</button></div></form></dialog>
+<dialog id="nasModal" class="modal"><form id="nasForm"><h3 id="nasFormTitle">إضافة جهاز NAS</h3><input type="hidden" name="id"><div class="formgrid">
+<div class="field"><label>طريقة الاتصال</label><select name="transport_mode" id="nasTransport" onchange="updateNasTransport()"><option value="portwarp">Portwarp UDP Tunnel</option><option value="direct">اتصال مباشر (IPv4 / CIDR)</option></select></div>
+<div class="field"><label>عنوان عميل RADIUS كما يراه السيرفر</label><input name="nasname" id="nasAddress" required value="127.0.0.1" placeholder="127.0.0.1" dir="ltr"></div>
+<div class="field"><label>اسم NAS / Short Name</label><input name="shortname" required maxlength="48" pattern="[A-Za-z0-9_.-]{1,48}" placeholder="mikrotik-main"></div>
+<div class="field"><label>النوع</label><select name="type"><option value="mikrotik">MikroTik</option><option value="wireless">Wireless</option><option value="other">Other</option></select></div>
+<div class="field full"><label>RADIUS Shared Secret (32 حرفًا على الأقل)</label><div class="quick"><input style="flex:1;min-width:200px" type="password" name="secret" id="nasSecret" minlength="32" autocomplete="new-password" dir="ltr"><button class="btn" type="button" onclick="generateNasSecret()">توليد مفتاح آمن</button><button class="btn" type="button" onclick="toggleNasSecret()">عرض / إخفاء</button></div><p class="note" id="nasSecretHint">يُولّد مفتاح عشوائي 256-bit ويُخزن على قاعدة البيانات. لن يظهر في جدول NAS؛ انسخه بعد الحفظ واضبط القيمة نفسها في MikroTik.</p></div>
+<div class="field full"><label>الوصف</label><input name="description" placeholder="الراوتر الرئيسي"></div>
+<div class="field full" id="nasTenantField" style="display:none"><label>الشبكة المالكة للجهاز</label><select name="tenant_id" id="nasTenant"><option value="">اختر الشبكة</option></select></div>
+<div class="field full"><div class="warning" id="nasTransportHint">Portwarp يمرر المصدر إلى 127.0.0.1. يُسمح بتعريف واحد لهذا النفق.</div></div>
+</div><div class="modalfoot"><button class="btn primary" type="submit">حفظ ومزامنة FreeRADIUS</button><button class="btn" type="button" onclick="closeModal('nasModal')">إلغاء</button></div></form></dialog>
+<dialog id="nasSecretOutput" class="modal"><h3>مفتاح RADIUS</h3><p class="warning" id="nasSecretOutputNote">احفظ المفتاح في مكان آمن واضبط القيمة نفسها في MikroTik. لن يتم عرضه مرة أخرى بعد إغلاق هذه النافذة.</p><div class="field"><input id="nasSecretShown" readonly dir="ltr" style="font-family:monospace"></div><div class="modalfoot"><button class="btn primary" type="button" onclick="copyNasSecret()">نسخ المفتاح</button><button class="btn" type="button" onclick="closeModal('nasSecretOutput')">تم</button></div></dialog>
 <dialog id="tenantModal" class="modal"><form id="tenantForm"><h3>إضافة شبكة / مالك شبكة</h3><div class="formgrid"><div class="field"><label>اسم الشبكة</label><input name="name" required></div><div class="field"><label>Slug بالإنجليزية</label><input name="slug" required pattern="[a-z0-9-]{3,50}"></div><div class="field"><label>البريد</label><input name="contact_email" type="email"></div><div class="field"><label>الهاتف</label><input name="contact_phone"></div><div class="field"><label>العملة</label><select name="currency"><option>EGP</option><option>USD</option><option>SAR</option></select></div><div class="field"><label>المنطقة الزمنية</label><input name="timezone" value="Africa/Cairo"></div></div><div class="modalfoot"><button class="btn primary" type="submit">إنشاء الشبكة</button><button class="btn" type="button" onclick="closeModal('tenantModal')">إلغاء</button></div></form></dialog>
 <dialog id="operatorModal" class="modal"><form id="operatorForm"><h3>إنشاء حساب إداري / عميل</h3><div class="formgrid"><div class="field"><label>اسم الدخول</label><input name="username" required></div><div class="field"><label>كلمة المرور (10 أحرف على الأقل)</label><input name="password" type="password" minlength="10" required></div><div class="field"><label>الاسم</label><input name="display_name"></div><div class="field"><label>البريد</label><input name="email" type="email"></div><div class="field"><label>الهاتف</label><input name="phone"></div><div class="field"><label>الصلاحية</label><select name="role"><option value="network_owner">مالك شبكة</option><option value="reseller">موزع</option><option value="support">دعم فني</option><option value="customer">عميل</option></select></div><div class="field full"><label>معرّف الشبكة UUID (للأدمن الأعلى)</label><input name="tenant_id" placeholder="يظهر في شاشة الشبكات"></div><div class="field full"><label>اسم مشترك RADIUS المرتبط (لحساب العميل)</label><input name="subscriber_username" placeholder="username من مشتركي الإنترنت"></div></div><div class="modalfoot"><button class="btn primary" type="submit">إنشاء الحساب</button><button class="btn" type="button" onclick="closeModal('operatorModal')">إلغاء</button></div></form></dialog>
 <dialog id="resellerModal" class="modal"><form id="resellerForm"><h3>إضافة موزع</h3><div class="formgrid"><div class="field"><label>اسم الدخول</label><input name="username" required></div><div class="field"><label>كلمة المرور</label><input name="password" type="password" minlength="10" required></div><div class="field"><label>الاسم</label><input name="display_name"></div><div class="field"><label>كود الموزع (اختياري)</label><input name="reseller_code"></div><div class="field"><label>عمولة %</label><input type="number" name="commission_percent" min="0" max="100" step=".01" value="0"></div><div class="field"><label>حد ائتماني</label><input type="number" name="credit_limit" min="0" step=".01" value="0"></div><div class="field full"><label>Tenant UUID (للأدمن الأعلى)</label><input name="tenant_id" placeholder="معرّف الشبكة"></div></div><div class="modalfoot"><button class="btn primary" type="submit">حفظ الموزع</button><button class="btn" type="button" onclick="closeModal('resellerModal')">إلغاء</button></div></form></dialog>
@@ -376,14 +541,26 @@ function closeModal(id){document.getElementById(id).close()}
 function allowedViews(){document.querySelectorAll(".nav button[data-roles]").forEach(function(b){var list=b.dataset.roles.split(",");b.style.display=list.indexOf(role)>=0?"block":"none"})}
 function showView(v){document.querySelectorAll(".section").forEach(function(s){s.classList.remove("show")});document.getElementById(v).classList.add("show");document.querySelectorAll(".nav button[data-view]").forEach(function(b){b.classList.toggle("active",b.dataset.view===v)});document.getElementById("viewTitle").textContent=titles[v][0];document.getElementById("viewDesc").textContent=titles[v][1];clearMessages();loadView(v)}
 document.querySelectorAll(".nav button[data-view]").forEach(function(b){b.addEventListener("click",function(){showView(b.dataset.view)})});
-document.querySelectorAll("[data-action]").forEach(function(b){b.addEventListener("click",function(){var a=b.dataset.action;var map={"new-user":"userModal","new-plan":"planModal","new-nas":"nasModal","new-tenant":"tenantModal","new-operator":"operatorModal","new-reseller":"resellerModal","new-voucher":"voucherModal","new-invoice":"invoiceModal","new-ticket":"ticketModal"};if(map[a])openModal(map[a])})});
+document.querySelectorAll("[data-action]").forEach(function(b){b.addEventListener("click",function(){var a=b.dataset.action;if(a==="new-nas"){newNas();return}var map={"new-user":"userModal","new-plan":"planModal","new-tenant":"tenantModal","new-operator":"operatorModal","new-reseller":"resellerModal","new-voucher":"voucherModal","new-invoice":"invoiceModal","new-ticket":"ticketModal"};if(map[a])openModal(map[a])})});
 async function loadHealth(){var el=document.getElementById("serviceStatus");try{var x=await api("health");el.innerHTML='<span style="color:#55d6b6">● Supabase API متصل</span><br>قاعدة البيانات: '+esc(x.database)+'<br>سجلات المصادقة: '+num(x.radcheck_rows)}catch(e){el.textContent=e.message}}
 async function loadOverview(){try{var x=await api("overview");document.getElementById("mUsers").textContent=num(x.subscribers);document.getElementById("mSessions").textContent=num(x.active_sessions);document.getElementById("mNas").textContent=num(x.nas_count);document.getElementById("mAccept").textContent=num(x.accepts_today);document.getElementById("mReject").textContent=num(x.rejects_today);document.getElementById("mPlans").textContent=num(x.active_plans);var logs=await api("logs");document.getElementById("recentLogs").innerHTML=logs.slice(0,6).map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+badge(z.reply)+"</td><td>"+esc(dt(z.authdate))+"</td><td>"+esc(z.callingstationid)+"</td></tr>"}).join("")||emptyRow(4)}catch(e){showError(e.message)}}
 async function loadUsers(){try{var x=await api("users");document.getElementById("usersTable").innerHTML=x.map(function(z){return "<tr><td><b>"+esc(z.username)+"</b></td><td>"+esc(z.display_name)+"</td><td>"+esc(z.plan&&z.plan.name)+"</td><td>"+esc(z.plan&&z.plan.download_mbps)+" / "+esc(z.plan&&z.plan.upload_mbps)+" Mbps</td><td>"+badge(z.enabled?"active":"disabled")+" "+(z.online?"<span class='badge'>online</span>":"")+"</td><td>"+num(z.max_devices)+"</td><td>"+esc(dt(z.expires_at))+"</td><td><button class='btn' onclick='userAction(\"disable\",\""+esc(z.username)+"\")'>إيقاف</button></td></tr>"}).join("")||emptyRow(8);var p=await api("plans");var o='<option value="">بدون باقة</option>'+p.map(function(t){return '<option value="'+t.id+'">'+esc(t.name)+" — "+num(t.download_mbps)+"/"+num(t.upload_mbps)+"</option>"}).join("");document.getElementById("userPlan").innerHTML=o;document.getElementById("voucherPlan").innerHTML=o}catch(e){showError(e.message)}}
 async function userAction(action,name){try{await api("users/action",{method:"POST",body:JSON.stringify({action:action,username:name})});showSuccess("تم تحديث حالة المشترك");loadUsers()}catch(e){showError(e.message)}}
 async function loadPlans(){try{var x=await api("plans");document.getElementById("plansTable").innerHTML=x.map(function(z){return "<tr><td><b>"+esc(z.name)+"</b></td><td>"+num(z.download_mbps)+" Mbps</td><td>"+num(z.upload_mbps)+" Mbps</td><td>"+(z.quota_mb?num(z.quota_mb)+" MB":"غير محدودة")+"</td><td>"+(z.session_timeout?num(z.session_timeout)+" ثانية":"—")+"</td><td>"+num(z.price)+"</td><td>"+badge(z.enabled?"active":"disabled")+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
-async function loadNas(){try{var x=await api("nas");document.getElementById("nasTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.nasname)+"</td><td>"+esc(z.shortname)+"</td><td>"+esc(z.type)+"</td><td>"+esc(z.description)+"</td><td>"+badge("registered")+"</td></tr>"}).join("")||emptyRow(5)}catch(e){showError(e.message)}}
-async function loadSessions(){try{var x=await api("sessions");document.getElementById("sessionsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.framedipaddress)+"</td><td>"+esc(z.nasipaddress)+"</td><td>"+esc(dt(z.acctstarttime))+"</td><td>"+num(z.acctsessiontime)+" s</td><td>"+bytes(z.acctinputoctets)+"</td><td>"+bytes(z.acctoutputoctets)+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
+var nasCache=[];
+function nasIsPortwarp(z){return z.transport_mode==="portwarp"||z.nasname==="127.0.0.1"||z.nasname==="127.0.0.1/32"}
+function loadNasStatus(message,isError){var e=document.getElementById("nasSyncStatus");if(!e)return;e.textContent=message;e.style.color=isError?"#ffb0b7":"#91dbc8"}
+async function loadNasTenants(selected){var field=document.getElementById("nasTenantField"),select=document.getElementById("nasTenant");field.style.display=role==="super_admin"?"block":"none";if(role!=="super_admin")return;var rows=await api("tenants");select.innerHTML='<option value="">اختر الشبكة</option>'+rows.map(function(t){return '<option value="'+esc(t.id)+'">'+esc(t.name)+' — '+esc(t.slug)+'</option>'}).join("");if(selected)select.value=selected;else if(rows.length===1)select.value=rows[0].id}
+async function loadNas(){try{var x=await api("nas");nasCache=Array.isArray(x)?x:[];document.getElementById("nasTable").innerHTML=nasCache.map(function(z){var id=Number(z.id),mode=nasIsPortwarp(z)?"Portwarp UDP":"Direct IPv4",secretState=z.secret_configured===false?"غير مضبوط":"مخزن • مخفي";return "<tr><td>"+badge(mode)+"</td><td dir='ltr'>"+esc(z.nasname)+"</td><td>"+esc(z.shortname)+"</td><td>"+esc(z.type)+"</td><td>"+badge(secretState)+"</td><td>"+esc(z.description)+"</td><td><div class='quick'><button class='btn' onclick='editNas("+id+")'>تعديل</button><button class='btn danger' onclick='nasAction(\"delete\","+id+")'>حذف</button></div></td></tr>"}).join("")||emptyRow(7);var pw=nasCache.filter(nasIsPortwarp).length;loadNasStatus("عدد NAS: "+nasCache.length+" • Portwarp ingress: "+pw+" • المفاتيح مخفية في الجدول.",false)}catch(e){showError(e.message);loadNasStatus(e.message,true)}}
+function updateNasTransport(){var f=document.getElementById("nasForm"),portwarp=f.elements.transport_mode.value==="portwarp",a=f.elements.nasname,h=document.getElementById("nasTransportHint"),id=Number(f.elements.id.value||0),otherPortwarp=nasCache.some(function(z){return nasIsPortwarp(z)&&Number(z.id)!==id});a.value=portwarp?"127.0.0.1":(a.value==="127.0.0.1"?"":a.value);a.readOnly=portwarp;h.textContent=portwarp?(otherPortwarp?"يوجد بالفعل Portwarp NAS. عدّل السجل الموجود بدلًا من إضافة سجل ثانٍ.":"Portwarp يمرر المصدر إلى السيرفر كـ 127.0.0.1. يستخدم هذا المسار تعريفًا واحدًا ومفتاحًا واحدًا."):"أدخل عنوان IPv4 أو CIDR لمصدر الحزم الذي يصل فعليًا إلى FreeRADIUS بعد NAT."}
+function generateNasSecret(){var a=new Uint8Array(32);crypto.getRandomValues(a);document.getElementById("nasSecret").value=Array.from(a,function(b){return b.toString(16).padStart(2,"0")}).join("")}
+function toggleNasSecret(){var e=document.getElementById("nasSecret");e.type=e.type==="password"?"text":"password"}
+async function newNas(){var f=document.getElementById("nasForm");f.reset();f.elements.id.value="";f.elements.secret.required=true;document.getElementById("nasFormTitle").textContent="إضافة جهاز NAS";var hasPortwarp=nasCache.some(nasIsPortwarp);f.elements.transport_mode.value=hasPortwarp?"direct":"portwarp";f.elements.nasname.value=hasPortwarp?"":"127.0.0.1";f.elements.nasname.readOnly=!hasPortwarp;document.getElementById("nasSecret").type="password";generateNasSecret();document.getElementById("nasSecretHint").textContent="تم توليد مفتاح عشوائي بطول 64 خانة (256-bit). سيظهر مرة واحدة بعد الحفظ.";await loadNasTenants();updateNasTransport();openModal("nasModal")}
+async function editNas(id){var z=nasCache.find(function(x){return Number(x.id)===Number(id)});if(!z)return;var f=document.getElementById("nasForm");f.reset();f.elements.id.value=z.id;f.elements.transport_mode.value=nasIsPortwarp(z)?"portwarp":"direct";f.elements.nasname.value=z.nasname;f.elements.shortname.value=z.shortname;f.elements.type.value=z.type||"other";f.elements.description.value=z.description||"";f.elements.secret.value="";f.elements.secret.required=false;document.getElementById("nasFormTitle").textContent="تعديل جهاز NAS";document.getElementById("nasSecretHint").textContent="اترك المفتاح فارغًا للاحتفاظ بالحالي، أو ولّد مفتاحًا جديدًا لتدويره.";document.getElementById("nasSecret").type="password";await loadNasTenants(z.tenant_id||"");updateNasTransport();openModal("nasModal")}
+async function copyNasSecret(){var e=document.getElementById("nasSecretShown");try{await navigator.clipboard.writeText(e.value);showSuccess("تم نسخ المفتاح")}catch(_){e.select();document.execCommand("copy");showSuccess("تم نسخ المفتاح")}}
+async function syncNas(){try{loadNasStatus("جارٍ توليد إعدادات NAS والتحقق من FreeRADIUS…",false);var x=await api("nas/sync",{method:"POST",body:"{}"});if(!x.ok)throw new Error(x.error||x.message||"فشلت مزامنة RADIUS");loadNasStatus("نجحت المزامنة. "+(x.generator||"")+" • "+(x.validation||"تم فحص الإعداد."),false);showSuccess("تم تطبيق إعدادات NAS على FreeRADIUS")}catch(e){loadNasStatus(e.message,true);showError(e.message)}}
+async function nasAction(action,id){if(action!=="delete"||!confirm("سيتم حذف سجل NAS وإعادة توليد إعدادات FreeRADIUS. هل تريد المتابعة؟"))return;try{var x=await api("nas/delete",{method:"POST",body:JSON.stringify({id:id})});if(x.radius_sync&&!x.radius_sync.ok){loadNasStatus("تم حذف السجل لكن فشلت مزامنة FreeRADIUS: "+x.radius_sync.error,true);showError("تم حذف NAS لكن يلزم فحص إعداد RADIUS.")}else{showSuccess("تم حذف NAS وتحديث إعدادات RADIUS");loadNasStatus("تم حذف NAS وإعادة تحميل إعداد FreeRADIUS.",false)}loadNas()}catch(e){showError(e.message);loadNas()}}
+document.getElementById("nasForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;try{var d=formData(f),id=d.id,secret=String(d.secret||"").trim();if(!id&&!secret)throw new Error("يجب إنشاء Shared Secret.");if(secret&&secret.length<32)throw new Error("Shared Secret يجب أن يكون 32 حرفًا على الأقل.");if(d.transport_mode==="portwarp"){if(nasCache.some(function(z){return nasIsPortwarp(z)&&Number(z.id)!==Number(id||0)}))throw new Error("يوجد بالفعل Portwarp NAS. افتح السجل الموجود وعدّله بدلًا من إنشاء سجل ثانٍ.");d.nasname="127.0.0.1"}if(d.transport_mode==="direct"&&!d.nasname)throw new Error("أدخل عنوان IPv4 أو CIDR.");if(role==="super_admin"&&!d.tenant_id)throw new Error("اختر الشبكة المالكة لجهاز NAS.");var path=id?"nas/update":"nas";var x=await api(path,{method:"POST",body:JSON.stringify(d)});closeModal("nasModal");var synced=!!(x.radius_sync&&x.radius_sync.ok);if(!synced){loadNasStatus("تم حفظ NAS لكن مزامنة FreeRADIUS لم تكتمل. لا تستخدم المفتاح الجديد في الراوتر قبل نجاح المزامنة. "+((x.radius_sync&&x.radius_sync.error)||""),true);showError("تم حفظ NAS في قاعدة البيانات لكن لم يتم تطبيق الإعداد على FreeRADIUS.")}else{loadNasStatus("تم حفظ NAS والتحقق من الإعداد وإعادة تحميل FreeRADIUS.",false);showSuccess("تم حفظ NAS وتطبيق إعداد RADIUS بنجاح")}if(secret){document.getElementById("nasSecretShown").value=secret;document.getElementById("nasSecretOutputNote").textContent=synced?"انسخ المفتاح واضبط القيمة نفسها في MikroTik. لن يمكن استعادته من الواجهة بعد إغلاق النافذة.":"المفتاح محفوظ، لكن مزامنة FreeRADIUS فشلت. لا تستخدمه في MikroTik حتى إصلاح المزامنة.";openModal("nasSecretOutput")}f.reset();loadNas()}catch(err){showError(err.message)}});async function loadSessions(){try{var x=await api("sessions");document.getElementById("sessionsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.framedipaddress)+"</td><td>"+esc(z.nasipaddress)+"</td><td>"+esc(dt(z.acctstarttime))+"</td><td>"+num(z.acctsessiontime)+" s</td><td>"+bytes(z.acctinputoctets)+"</td><td>"+bytes(z.acctoutputoctets)+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
 async function loadLogs(){try{var x=await api("logs");document.getElementById("logsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+badge(z.reply)+"</td><td>"+esc(dt(z.authdate))+"</td><td>"+esc(z.callingstationid)+"</td><td>"+esc(z.calledstationid)+"</td></tr>"}).join("")||emptyRow(5)}catch(e){showError(e.message)}}
 async function loadNetworks(){try{var x=await api("tenants");document.getElementById("networksTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.name)+"</td><td>"+esc(z.slug)+"</td><td><code>"+esc(z.id)+"</code></td><td>"+esc(z.plan_code)+"</td><td>"+badge(z.status)+"</td><td>"+esc(z.currency)+"</td><td>"+esc(dt(z.created_at))+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
 async function loadOperators(){try{var x=await api("operators");document.getElementById("operatorsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.display_name)+"</td><td>"+esc(z.role)+"</td><td>"+esc(z.tenant_id)+"</td><td>"+esc(z.email)+"</td><td>"+badge(z.status)+"</td><td>"+esc(dt(z.last_login_at))+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
@@ -399,7 +576,6 @@ function loadView(v){if(v==="overview"){if(role==="customer")loadCustomer();else
 async function submitForm(id,path,method,success){var f=document.getElementById(id);f.addEventListener("submit",async function(e){e.preventDefault();try{var data=formData(f);if(data.expires_at)data.expires_at=new Date(data.expires_at).toISOString();var result=await api(path,{method:method,body:JSON.stringify(data)});closeModal(id.replace("Form","Modal"));f.reset();showSuccess(success);if(path==="vouchers"&&result.vouchers){document.getElementById("voucherOutputTable").innerHTML=result.vouchers.map(function(v){return "<tr><td>"+esc(v.username)+"</td><td>"+esc(v.pin)+"</td></tr>"}).join("");openModal("voucherOutput")}loadView(document.querySelector(".section.show").id)}catch(err){showError(err.message)}})}
 submitForm("userForm","users","POST","تم حفظ المشترك");
 submitForm("planForm","plans","POST","تم إنشاء الباقة");
-submitForm("nasForm","nas","POST","تم تسجيل جهاز NAS");
 submitForm("tenantForm","tenants","POST","تم إنشاء الشبكة");
 submitForm("operatorForm","operators","POST","تم إنشاء الحساب");
 submitForm("resellerForm","resellers","POST","تم إنشاء الموزع");
@@ -423,7 +599,9 @@ routes = [
     Route("/radius/api/users/action", api_user_action, methods=["POST"]),
     Route("/radius/api/plans", api_plans, methods=["GET","POST"]),
     Route("/radius/api/nas", api_nas, methods=["GET","POST"]),
+    Route("/radius/api/nas/update", api_nas_update, methods=["POST"]),
     Route("/radius/api/nas/delete", api_nas_delete, methods=["POST"]),
+    Route("/radius/api/nas/sync", api_nas_sync, methods=["POST"]),
     Route("/radius/api/sessions", api_sessions, methods=["GET"]),
     Route("/radius/api/logs", api_logs, methods=["GET"]),
     Route("/radius/api/tenants", api_tenants, methods=["GET","POST"]),
