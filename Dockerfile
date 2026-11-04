@@ -23,7 +23,9 @@ COPY radius_panel.py /opt/debian-root-mcp/radius_panel.py
 COPY configure_radius.py /opt/debian-root-mcp/configure_radius.py
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY start-with-radius.sh /usr/local/bin/start-with-radius.sh
-RUN chmod 0755 /usr/local/bin/start-with-radius.sh /opt/debian-root-mcp/configure_radius.py
+RUN chmod 0755 /usr/local/bin/start-with-radius.sh /opt/debian-root-mcp/configure_radius.py \
+    && /opt/debian-root-mcp/.venv/bin/python -m py_compile /opt/debian-root-mcp/server.py /opt/debian-root-mcp/radius_panel.py /opt/debian-root-mcp/configure_radius.py \
+    && nginx -t -c /etc/nginx/nginx.conf
 
 EXPOSE 6901 5901 1812/udp 1813/udp
 CMD ["/usr/local/bin/start-with-radius.sh"]
