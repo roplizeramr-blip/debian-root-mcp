@@ -27,16 +27,25 @@ else
     echo "RADIUS_API_URL/RADIUS_API_KEY not configured; FreeRADIUS remains disabled."
 fi
 
-# Portwarp state is persisted on the /root/.portwarp CranL volume.
-# Once the owner has approved pwrp login and created UDP tunnels, reconnect
-# all enabled tunnels on every container start. A missing login/tunnel is
-# non-fatal and must never take down the dashboard or FreeRADIUS.
+# Portwarp login and daemon state belong to the dedicated headless account.
+# Use the same HOME/XDG_CONFIG_HOME for the CLI and daemon on every container
+# start; otherwise root may see an empty profile and fail to restore saved UDP
+# forwarding sessions. The persistent home volume keeps the browser-approved
+# credentials and tunnel selection across redeployments.
+PORTWARP_HOME="${PORTWARP_HOME:-/home/headless}"
 if command -v pwrp >/dev/null 2>&1 && [[ -n "$RADIUS_PID" ]]; then
-    install -d -m 0700 /root/.portwarp
-    if pwrp connect --all --save --detach; then
-        echo "Portwarp tunnel connection requested."
+    if [[ -r "${PORTWARP_HOME}/.portwarp/credentials.json" ]]; then
+        if (
+            export HOME="$PORTWARP_HOME"
+            export XDG_CONFIG_HOME="${PORTWARP_HOME}/.config"
+            pwrp connect --all --save --detach
+        ); then
+            echo "Portwarp tunnel reconnect requested using the saved headless profile."
+        else
+            echo "Portwarp could not reconnect; dashboard and FreeRADIUS remain available." >&2
+        fi
     else
-        echo "Portwarp is not configured yet; run 'pwrp login' and create the UDP tunnels." >&2
+        echo "Portwarp login not found under ${PORTWARP_HOME}; run 'pwrp login' from the headless desktop account." >&2
     fi
 fi
 
