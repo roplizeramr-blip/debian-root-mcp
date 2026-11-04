@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Authorize Debian Admin MCP</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1020;color:#e8edf7}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}main{width:min(100%,520px);background:#151d31;border:1px solid #293650;border-radius:18px;padding:28px;box-shadow:0 24px 80px #0006}h1{font-size:25px;margin:0 0 8px}p{color:#aebbd0;line-height:1.55}.muted{font-size:13px;color:#91a0b8}label{display:block;margin:16px 0 7px}input{width:100%;padding:13px;border-radius:10px;border:1px solid #394966;background:#0d1527;color:white;font-size:15px}button{border:0;border-radius:10px;padding:12px 16px;font-weight:650;cursor:pointer}.primary{background:#5b8cff;color:#081226}.secondary{background:#26344c;color:#e8edf7}.actions{display:flex;gap:10px;margin-top:22px}.actions button{flex:1}#status{margin-top:14px;white-space:pre-wrap;color:#ffb8b8;font-size:14px}#consent,#logout{display:none}.panel{background:#0d1527;border:1px solid #2a3954;border-radius:12px;padding:14px;margin-top:16px}ul{padding-left:22px;color:#d3deef}li{margin:7px 0}
+</style></head><body><main>
+<h1>Connect Debian Admin MCP</h1>
+<p>This approval gives the connected AI client access to inspect this Debian container, manage only FreeRADIUS and Nginx, and edit approved service configuration files.</p>
+<p class="muted">No unrestricted shell access is exposed. You can revoke the OAuth grant later in Supabase.</p>
+<section id="login"><h2>Sign in</h2><p>Use the owner account created in Supabase Authentication. Public registration is disabled.</p>
+<form id="loginForm"><label for="email">Email</label><input id="email" type="email" autocomplete="username" required><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><div class="actions"><button class="primary" type="submit">Sign in</button></div></form></section>
+<section id="consent"><div class="panel"><p><strong>Application:</strong> <span id="clientName">Loading…</span></p><p><strong>Redirect URI:</strong> <span id="redirectUri"></span></p><p><strong>Requested OAuth scopes:</strong></p><ul id="scopes"></ul></div>
+<div class="panel"><strong>Administrative capabilities requested</strong><ul><li>Read Debian system status and service logs</li><li>Start, stop, restart or reload FreeRADIUS and Nginx</li><li>Read and write configuration files in approved directories</li><li>Run FreeRADIUS and Nginx configuration validation</li></ul></div>
+<div class="actions"><button id="deny" class="secondary" type="button">Deny</button><button id="approve" class="primary" type="button">Approve access</button></div><button id="logout" class="secondary" type="button">Sign out</button></section>
+<div id="status" role="status" aria-live="polite"></div></main>
+<script type="module">
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const supabase=createClient("https://wloqbuigxcbcxprmnyjq.supabase.co","sb_publishable_QD4x42E4wdvqXLTedt5f3w_i9hlnO73");
+const authorizationId=new URLSearchParams(location.search).get("authorization_id");
+const login=document.getElementById("login"), consent=document.getElementById("consent"), statusBox=document.getElementById("status"), logout=document.getElementById("logout");
+function errorText(e){statusBox.textContent=e&&e.message?e.message:String(e||"Unknown error")}
+function showScopes(scope){const list=document.getElementById("scopes");list.replaceChildren();(scope||"").split(/\s+/).filter(Boolean).forEach(v=>{const li=document.createElement("li");li.textContent=v;list.appendChild(li)});if(!list.children.length){const li=document.createElement("li");li.textContent="No OIDC profile scopes requested";list.appendChild(li)}}
+async function loadAuthorization(){
+ if(!authorizationId){errorText("Missing authorization_id. Start the connection from ChatGPT again.");return}
+ const {data:sessionData}=await supabase.auth.getSession();
+ if(!sessionData.session){login.style.display="block";consent.style.display="none";return}
+ login.style.display="none";
+ const {data,error}=await supabase.auth.oauth.getAuthorizationDetails(authorizationId);if(error)throw error;
+ if(data&&!Object.hasOwn(data,"authorization_id")){location.assign(data.redirect_url);return}
+ document.getElementById("clientName").textContent=data.client?.name||"Unknown OAuth client";
+ document.getElementById("redirectUri").textContent=data.redirect_uri||"Not supplied";showScopes(data.scope);
+ consent.style.display="block";logout.style.display="inline-block";
+}
+document.getElementById("loginForm").addEventListener("submit",async e=>{e.preventDefault();statusBox.textContent="Signing in…";const {error}=await supabase.auth.signInWithPassword({email:document.getElementById("email").value.trim(),password:document.getElementById("password").value});if(error)return errorText(error);statusBox.textContent="";try{await loadAuthorization()}catch(e){errorText(e)}});
+document.getElementById("approve").addEventListener("click",async()=>{statusBox.textContent="Approving access…";const {data,error}=await supabase.auth.oauth.approveAuthorization(authorizationId);if(error)return errorText(error);location.assign(data.redirect_url)});
+document.getElementById("deny").addEventListener("click",async()=>{statusBox.textContent="Denying access…";const {data,error}=await supabase.auth.oauth.denyAuthorization(authorizationId);if(error)return errorText(error);location.assign(data.redirect_url)});
+logout.addEventListener("click",async()=>{await supabase.auth.signOut();consent.style.display="none";login.style.display="block";logout.style.display="none"});
+try{await loadAuthorization()}catch(e){errorText(e)}
+</script></body></html>
