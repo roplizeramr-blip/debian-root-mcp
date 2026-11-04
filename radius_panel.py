@@ -6,7 +6,9 @@ import json
 import os
 import re
 import time
-from datetime import datetime
+import ipaddress
+from decimal import Decimal
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -53,7 +55,25 @@ def _session(request: Request) -> dict[str, Any] | None:
         return None
 
 
+def _clean(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address, ipaddress.IPv4Network, ipaddress.IPv6Network)):
+        return str(value)
+    return value
+
+
+def _row(row: asyncpg.Record) -> dict[str, Any]:
+    return {key: _clean(value) for key, value in dict(row).items()}
+
+
 def _json(data: Any, status: int = 200) -> JSONResponse:
+    if isinstance(data, list):
+        data = [{key: _clean(value) for key, value in item.items()} if isinstance(item, dict) else _clean(item) for item in data]
+    elif isinstance(data, dict):
+        data = {key: _clean(value) for key, value in data.items()}
     return JSONResponse(data, status_code=status, headers={"Cache-Control": "no-store"})
 
 
@@ -164,7 +184,7 @@ async def api_overview(request: Request) -> Response:
                   (SELECT count(*) FROM radius.radpostauth WHERE authdate >= date_trunc('day', now()) AND reply='Access-Reject') AS rejects_today,
                   (SELECT coalesce(sum(coalesce(acctinputoctets,0)+coalesce(acctoutputoctets,0)),0) FROM radius.radacct) AS total_octets
             """)
-        return _json(dict(row))
+        return _json(_row(row))
     except Exception as exc:
         return _json({"error": str(exc)[:240]}, 503)
 
@@ -184,7 +204,7 @@ async def api_users(request: Request) -> Response:
                 LEFT JOIN radius.radius_plans p ON p.id=m.plan_id
                 ORDER BY m.created_at DESC LIMIT 300
             """)
-        return _json([dict(row) for row in rows])
+        return _json([_row(row) for row in rows])
     except Exception as exc:
         return _json({"error": str(exc)[:240]}, 503)
 
