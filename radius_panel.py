@@ -220,10 +220,11 @@ async def api_plans(request: Request) -> Response:
 
 
 def _nas_sync_worker() -> dict[str, Any]:
-    """Regenerate, validate and reload the FreeRADIUS client list.
+    """Regenerate, validate, and restart FreeRADIUS so its client list is reloaded.
 
-    Changes are rolled back if generation or validation fails. A NAS DB write
-    is not rolled back here; the API response clearly reports a sync failure.
+    FreeRADIUS does not reload clients.conf on SIGHUP. Changes are rolled back
+    if generation, validation, or restart fails. A NAS DB write is not rolled
+    back here; the API response clearly reports a sync failure.
     """
     script = Path("/opt/debian-root-mcp/configure_radius.py")
     if not script.is_file():
@@ -244,6 +245,47 @@ def _nas_sync_worker() -> dict[str, Any]:
         snapshots[key] = path.read_bytes() if path.is_file() else None
         if path.exists():
             modes[key] = path.stat().st_mode & 0o777
+
+    radius_stopped = False
+
+    def _start_radius() -> int:
+        process = subprocess.Popen(
+            ["freeradius", "-f"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"FreeRADIUS exited during startup (code {process.returncode}); "
+                    "check /var/log/freeradius/radius.log"
+                )
+            listeners = subprocess.run(
+                ["ss", "-H", "-lun"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if (
+                listeners.returncode == 0
+                and ":1812" in listeners.stdout
+                and ":1813" in listeners.stdout
+            ):
+                return process.pid
+            time.sleep(0.15)
+
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise RuntimeError("FreeRADIUS started but UDP 1812/1813 did not become ready")
 
     try:
         setup = subprocess.run(
@@ -281,12 +323,28 @@ def _nas_sync_worker() -> dict[str, Any]:
         if finder.returncode != 0 or not pid_text.isdigit():
             raise RuntimeError("Configuration is valid, but the FreeRADIUS process was not found")
 
-        os.kill(int(pid_text), signal.SIGHUP)
+        old_pid = int(pid_text)
+        os.kill(old_pid, signal.SIGTERM)
+        radius_stopped = True
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(old_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(old_pid, signal.SIGKILL)
+            time.sleep(0.2)
+
+        new_pid = _start_radius()
+        radius_stopped = False
         return {
             "ok": True,
-            "message": "NAS records synchronized; FreeRADIUS configuration validated and reloaded.",
+            "message": "NAS records synchronized; FreeRADIUS configuration validated and service restarted.",
             "generator": (setup.stdout or "").strip()[-500:],
             "validation": "Configuration appears to be OK",
+            "process_id": new_pid,
         }
     except Exception as exc:
         rollback_errors = []
@@ -305,15 +363,29 @@ def _nas_sync_worker() -> dict[str, Any]:
                     path.chmod(modes.get(key, 0o640))
             except OSError as rollback_exc:
                 rollback_errors.append(str(rollback_exc)[:180])
+
+        if radius_stopped:
+            try:
+                active = subprocess.run(
+                    ["pgrep", "-xo", "freeradius"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if active.returncode != 0:
+                    _start_radius()
+            except Exception as recovery_exc:
+                rollback_errors.append("FreeRADIUS recovery failed: " + str(recovery_exc)[:180])
+
         message = str(exc)[:1600]
         if rollback_errors:
-            message += " | rollback warning: " + "; ".join(rollback_errors)
+            message += " | recovery warning: " + "; ".join(rollback_errors)
         return {
             "ok": False,
             "error": message,
-            "message": "NAS data may be saved, but FreeRADIUS was not reloaded.",
+            "message": "NAS data may be saved, but FreeRADIUS restart did not complete.",
         }
-
 
 async def _nas_mutation(request: Request, operation: str) -> Response:
     claims, error = _authorized(request, True, ("super_admin", "network_owner"))
@@ -560,8 +632,8 @@ async function newNas(){var f=document.getElementById("nasForm");f.reset();f.ele
 async function editNas(id){var z=nasCache.find(function(x){return Number(x.id)===Number(id)});if(!z)return;var f=document.getElementById("nasForm");f.reset();f.elements.id.value=z.id;f.elements.transport_mode.value=nasIsPortwarp(z)?"portwarp":"direct";f.elements.nasname.value=z.nasname;f.elements.shortname.value=z.shortname;f.elements.type.value=z.type||"other";f.elements.description.value=z.description||"";f.elements.secret.value="";f.elements.secret.required=false;document.getElementById("nasFormTitle").textContent="تعديل جهاز NAS";document.getElementById("nasSecretHint").textContent="اترك المفتاح فارغًا للاحتفاظ بالحالي، أو ولّد مفتاحًا جديدًا لتدويره.";document.getElementById("nasSecret").type="password";await loadNasTenants(z.tenant_id||"");updateNasTransport();openModal("nasModal")}
 async function copyNasSecret(){var e=document.getElementById("nasSecretShown");try{await navigator.clipboard.writeText(e.value);showSuccess("تم نسخ المفتاح")}catch(_){e.select();document.execCommand("copy");showSuccess("تم نسخ المفتاح")}}
 async function syncNas(){try{loadNasStatus("جارٍ توليد إعدادات NAS والتحقق من FreeRADIUS…",false);var x=await api("nas/sync",{method:"POST",body:"{}"});if(!x.ok)throw new Error(x.error||x.message||"فشلت مزامنة RADIUS");loadNasStatus("نجحت المزامنة. "+(x.generator||"")+" • "+(x.validation||"تم فحص الإعداد."),false);showSuccess("تم تطبيق إعدادات NAS على FreeRADIUS")}catch(e){loadNasStatus(e.message,true);showError(e.message)}}
-async function nasAction(action,id){if(action!=="delete"||!confirm("سيتم حذف سجل NAS وإعادة توليد إعدادات FreeRADIUS. هل تريد المتابعة؟"))return;try{var x=await api("nas/delete",{method:"POST",body:JSON.stringify({id:id})});if(x.radius_sync&&!x.radius_sync.ok){loadNasStatus("تم حذف السجل لكن فشلت مزامنة FreeRADIUS: "+x.radius_sync.error,true);showError("تم حذف NAS لكن يلزم فحص إعداد RADIUS.")}else{showSuccess("تم حذف NAS وتحديث إعدادات RADIUS");loadNasStatus("تم حذف NAS وإعادة تحميل إعداد FreeRADIUS.",false)}loadNas()}catch(e){showError(e.message);loadNas()}}
-document.getElementById("nasForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;try{var d=formData(f),id=d.id,secret=String(d.secret||"").trim();if(!id&&!secret)throw new Error("يجب إنشاء Shared Secret.");if(secret&&secret.length<32)throw new Error("Shared Secret يجب أن يكون 32 حرفًا على الأقل.");if(d.transport_mode==="portwarp"){if(nasCache.some(function(z){return nasIsPortwarp(z)&&Number(z.id)!==Number(id||0)}))throw new Error("يوجد بالفعل Portwarp NAS. افتح السجل الموجود وعدّله بدلًا من إنشاء سجل ثانٍ.");d.nasname="127.0.0.1"}if(d.transport_mode==="direct"&&!d.nasname)throw new Error("أدخل عنوان IPv4 أو CIDR.");if(role==="super_admin"&&!d.tenant_id)throw new Error("اختر الشبكة المالكة لجهاز NAS.");var path=id?"nas/update":"nas";var x=await api(path,{method:"POST",body:JSON.stringify(d)});closeModal("nasModal");var synced=!!(x.radius_sync&&x.radius_sync.ok);if(!synced){loadNasStatus("تم حفظ NAS لكن مزامنة FreeRADIUS لم تكتمل. لا تستخدم المفتاح الجديد في الراوتر قبل نجاح المزامنة. "+((x.radius_sync&&x.radius_sync.error)||""),true);showError("تم حفظ NAS في قاعدة البيانات لكن لم يتم تطبيق الإعداد على FreeRADIUS.")}else{loadNasStatus("تم حفظ NAS والتحقق من الإعداد وإعادة تحميل FreeRADIUS.",false);showSuccess("تم حفظ NAS وتطبيق إعداد RADIUS بنجاح")}if(secret){document.getElementById("nasSecretShown").value=secret;document.getElementById("nasSecretOutputNote").textContent=synced?"انسخ المفتاح واضبط القيمة نفسها في MikroTik. لن يمكن استعادته من الواجهة بعد إغلاق النافذة.":"المفتاح محفوظ، لكن مزامنة FreeRADIUS فشلت. لا تستخدمه في MikroTik حتى إصلاح المزامنة.";openModal("nasSecretOutput")}f.reset();loadNas()}catch(err){showError(err.message)}});async function loadSessions(){try{var x=await api("sessions");document.getElementById("sessionsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.framedipaddress)+"</td><td>"+esc(z.nasipaddress)+"</td><td>"+esc(dt(z.acctstarttime))+"</td><td>"+num(z.acctsessiontime)+" s</td><td>"+bytes(z.acctinputoctets)+"</td><td>"+bytes(z.acctoutputoctets)+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
+async function nasAction(action,id){if(action!=="delete"||!confirm("سيتم حذف سجل NAS وإعادة توليد إعدادات FreeRADIUS. هل تريد المتابعة؟"))return;try{var x=await api("nas/delete",{method:"POST",body:JSON.stringify({id:id})});if(x.radius_sync&&!x.radius_sync.ok){loadNasStatus("تم حذف السجل لكن فشلت مزامنة FreeRADIUS: "+x.radius_sync.error,true);showError("تم حذف NAS لكن يلزم فحص إعداد RADIUS.")}else{showSuccess("تم حذف NAS وتحديث إعدادات RADIUS");loadNasStatus("تم حذف NAS وإعادة تشغيل خدمة FreeRADIUS.",false)}loadNas()}catch(e){showError(e.message);loadNas()}}
+document.getElementById("nasForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;try{var d=formData(f),id=d.id,secret=String(d.secret||"").trim();if(!id&&!secret)throw new Error("يجب إنشاء Shared Secret.");if(secret&&secret.length<32)throw new Error("Shared Secret يجب أن يكون 32 حرفًا على الأقل.");if(d.transport_mode==="portwarp"){if(nasCache.some(function(z){return nasIsPortwarp(z)&&Number(z.id)!==Number(id||0)}))throw new Error("يوجد بالفعل Portwarp NAS. افتح السجل الموجود وعدّله بدلًا من إنشاء سجل ثانٍ.");d.nasname="127.0.0.1"}if(d.transport_mode==="direct"&&!d.nasname)throw new Error("أدخل عنوان IPv4 أو CIDR.");if(role==="super_admin"&&!d.tenant_id)throw new Error("اختر الشبكة المالكة لجهاز NAS.");var path=id?"nas/update":"nas";var x=await api(path,{method:"POST",body:JSON.stringify(d)});closeModal("nasModal");var synced=!!(x.radius_sync&&x.radius_sync.ok);if(!synced){loadNasStatus("تم حفظ NAS لكن مزامنة FreeRADIUS لم تكتمل. لا تستخدم المفتاح الجديد في الراوتر قبل نجاح المزامنة. "+((x.radius_sync&&x.radius_sync.error)||""),true);showError("تم حفظ NAS في قاعدة البيانات لكن لم يتم تطبيق الإعداد على FreeRADIUS.")}else{loadNasStatus("تم حفظ NAS والتحقق من الإعداد وإعادة تشغيل FreeRADIUS.",false);showSuccess("تم حفظ NAS وتطبيق إعداد RADIUS بنجاح")}if(secret){document.getElementById("nasSecretShown").value=secret;document.getElementById("nasSecretOutputNote").textContent=synced?"انسخ المفتاح واضبط القيمة نفسها في MikroTik. لن يمكن استعادته من الواجهة بعد إغلاق النافذة.":"المفتاح محفوظ، لكن مزامنة FreeRADIUS فشلت. لا تستخدمه في MikroTik حتى إصلاح المزامنة.";openModal("nasSecretOutput")}f.reset();loadNas()}catch(err){showError(err.message)}});async function loadSessions(){try{var x=await api("sessions");document.getElementById("sessionsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.framedipaddress)+"</td><td>"+esc(z.nasipaddress)+"</td><td>"+esc(dt(z.acctstarttime))+"</td><td>"+num(z.acctsessiontime)+" s</td><td>"+bytes(z.acctinputoctets)+"</td><td>"+bytes(z.acctoutputoctets)+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
 async function loadLogs(){try{var x=await api("logs");document.getElementById("logsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+badge(z.reply)+"</td><td>"+esc(dt(z.authdate))+"</td><td>"+esc(z.callingstationid)+"</td><td>"+esc(z.calledstationid)+"</td></tr>"}).join("")||emptyRow(5)}catch(e){showError(e.message)}}
 async function loadNetworks(){try{var x=await api("tenants");document.getElementById("networksTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.name)+"</td><td>"+esc(z.slug)+"</td><td><code>"+esc(z.id)+"</code></td><td>"+esc(z.plan_code)+"</td><td>"+badge(z.status)+"</td><td>"+esc(z.currency)+"</td><td>"+esc(dt(z.created_at))+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
 async function loadOperators(){try{var x=await api("operators");document.getElementById("operatorsTable").innerHTML=x.map(function(z){return "<tr><td>"+esc(z.username)+"</td><td>"+esc(z.display_name)+"</td><td>"+esc(z.role)+"</td><td>"+esc(z.tenant_id)+"</td><td>"+esc(z.email)+"</td><td>"+badge(z.status)+"</td><td>"+esc(dt(z.last_login_at))+"</td></tr>"}).join("")||emptyRow(7)}catch(e){showError(e.message)}}
