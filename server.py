@@ -3,16 +3,56 @@ import json, os, re, shutil, subprocess, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import httpx
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.supabase import SupabaseProvider
+from fastmcp.server.auth import RemoteAuthProvider
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from pydantic import AnyHttpUrl
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 SUPABASE_PROJECT_URL = os.environ["SUPABASE_PROJECT_URL"].rstrip("/")
+SUPABASE_ISSUER = SUPABASE_PROJECT_URL + "/auth/v1"
 BASE_URL = os.environ["MCP_BASE_URL"].rstrip("/")
 JWT_ALGORITHM = os.environ.get("SUPABASE_JWT_ALGORITHM", "ES256").upper()
 if JWT_ALGORITHM not in {"ES256", "RS256"}:
     raise RuntimeError("Use an asymmetric Supabase JWT signing algorithm: ES256 or RS256")
 
-auth = SupabaseProvider(project_url=SUPABASE_PROJECT_URL, base_url=BASE_URL, algorithm=JWT_ALGORITHM)
+verifier = JWTVerifier(
+    jwks_uri=SUPABASE_ISSUER + "/.well-known/jwks.json",
+    issuer=SUPABASE_ISSUER,
+    audience="authenticated",
+)
+
+class SupabaseMCPAuth(RemoteAuthProvider):
+    """Supabase JWT resource server with Supabase's path-aware OAuth metadata URL."""
+
+    def get_routes(self, mcp_path: str | None = None):
+        routes = super().get_routes(mcp_path=mcp_path)
+
+        async def authorization_server_metadata(request):
+            metadata_url = SUPABASE_PROJECT_URL + "/.well-known/oauth-authorization-server/auth/v1"
+            try:
+                async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                    response = await client.get(metadata_url)
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {"error": "Supabase OAuth metadata is not valid JSON"}
+                return JSONResponse(payload, status_code=response.status_code)
+            except Exception as exc:
+                return JSONResponse({"error": "Unable to fetch Supabase OAuth metadata",
+                                     "detail": str(exc)}, status_code=502)
+
+        routes.append(Route("/.well-known/oauth-authorization-server", authorization_server_metadata,
+                            methods=["GET"]))
+        return routes
+
+auth = SupabaseMCPAuth(
+    token_verifier=verifier,
+    authorization_servers=[AnyHttpUrl(SUPABASE_ISSUER)],
+    base_url=BASE_URL,
+)
 mcp = FastMCP("Debian noVNC and FreeRADIUS Admin", auth=auth)
 
 AUDIT_FILE = Path("/var/log/debian-root-mcp/audit.jsonl")
