@@ -51,7 +51,7 @@ BASE_URL = os.environ["MCP_BASE_URL"].rstrip("/")
 if not BASE_URL.startswith("https://"):
     raise RuntimeError("MCP_BASE_URL must be a public HTTPS URL")
 
-ISSUER = BASE_URL
+ISSUER = BASE_URL + "/"
 RESOURCE = BASE_URL + "/mcp"
 AUTHORIZATION_ENDPOINT = BASE_URL + "/authorize"
 TOKEN_ENDPOINT = BASE_URL + "/token"
