@@ -162,7 +162,6 @@ def main() -> int:
         uri = "\u0024{{..connect_uri}}?op=radius.accounting"
         method = "post"
         body = "json"
-        force_to = "json"
         timeout = 5.0
         tls = \u0024{{..tls}}
         do_xlat = no
@@ -171,7 +170,6 @@ def main() -> int:
         uri = "\u0024{{..connect_uri}}?op=radius.postauth"
         method = "post"
         body = "json"
-        force_to = "json"
         timeout = 5.0
         tls = \u0024{{..tls}}
         do_xlat = no
