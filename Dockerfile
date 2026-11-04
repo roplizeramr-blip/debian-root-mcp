@@ -1,0 +1,26 @@
+FROM accetto/debian-vnc-xfce-g3:latest
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive \
+    NOVNC_PORT=6902 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      nginx python3 python3-venv python3-pip ca-certificates \
+      freeradius freeradius-postgresql freeradius-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/debian-root-mcp
+COPY requirements.txt .
+RUN python3 -m venv /opt/debian-root-mcp/.venv \
+    && /opt/debian-root-mcp/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/debian-root-mcp/.venv/bin/pip install --no-cache-dir -r requirements.txt
+
+COPY server.py /opt/debian-root-mcp/server.py
+COPY nginx.conf /etc/nginx/nginx.conf
+COPY start-with-radius.sh /usr/local/bin/start-with-radius.sh
+RUN chmod 0755 /usr/local/bin/start-with-radius.sh
+
+EXPOSE 6901 5901 1812/udp 1813/udp
+CMD ["/usr/local/bin/start-with-radius.sh"]
