@@ -30,20 +30,20 @@ fi
 /dockerstartup/startup.sh &
 DESKTOP_PID=$!
 
-PIDS=("$MCP_PID" "$DESKTOP_PID")
-if [[ -n "$RADIUS_PID" ]]; then
-    PIDS+=("$RADIUS_PID")
-fi
-
 cleanup() {
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+    for pid in "${MCP_PID:-}" "${RADIUS_PID:-}" "${DESKTOP_PID:-}"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
     done
 }
 trap cleanup EXIT INT TERM
 
+# MCP is the required long-running process. Desktop startup helpers may exit
+# after daemonizing their services; FreeRADIUS must not take down MCP if it
+# encounters a later network/API failure.
 set +e
-wait -n "${PIDS[@]}"
+wait "$MCP_PID"
 STATUS=$?
 set -e
 exit "$STATUS"
