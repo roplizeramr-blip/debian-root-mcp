@@ -94,7 +94,7 @@ async def _db() -> asyncpg.Pool:
         min_size=1,
         max_size=3,
         ssl="require",
-        server_settings={"search_path": "radius,public", "application_name": "debian-radius-panel"},
+        server_settings={"application_name": "debian-radius-panel"},
         command_timeout=8,
     )
     return _pool
