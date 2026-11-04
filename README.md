@@ -4,7 +4,9 @@ Self-hosted OAuth 2.1 authorization server and MCP resource server running insid
 
 ## Endpoints
 
-- MCP Streamable HTTP: `https://YOUR-APP-DOMAIN/mcp`
+- MCP Streamable HTTP transport: `https://YOUR-APP-DOMAIN/mcp`
+- Canonical OAuth resource identifier (RFC 8707): `https://YOUR-APP-DOMAIN` (origin, with no `/mcp` suffix; this matches ChatGPT's resource indicator)
+- Protected resource metadata: `/.well-known/oauth-protected-resource` (root discovery path; the document's `resource` is the origin above)
 - OAuth authorization server metadata: `/.well-known/oauth-authorization-server`
 - Protected resource metadata: `/.well-known/oauth-protected-resource/mcp`
 - Authorization endpoint: `/authorize`
@@ -17,7 +19,7 @@ Self-hosted OAuth 2.1 authorization server and MCP resource server running insid
 - OAuth 2.1 Authorization Code grant with PKCE S256.
 - ChatGPT Client ID Metadata Documents (CIMD); client metadata is fetched from an allowlisted `chatgpt.com` URL.
 - The token endpoint supports `private_key_jwt` and public-client `none` authentication.
-- Access tokens are signed JWTs with an exact issuer, MCP resource audience, client ID, subject, scope, expiry, and token ID.
+- Access tokens are signed JWTs with an exact issuer, canonical origin audience, client ID, subject, scope, expiry, and token ID. The bearer middleware publishes the corresponding `WWW-Authenticate` resource-metadata challenge.
 - Required scope: `debian.root`. Refresh tokens are issued for reconnects.
 - Consent requires a separate Debian MCP administrator account. This account is not the Linux root password.
 
