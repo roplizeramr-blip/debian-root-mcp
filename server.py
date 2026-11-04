@@ -27,6 +27,7 @@ from starlette.routing import Route
 from uvicorn import run as uvicorn_run
 
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.auth.handlers.authorize import AuthorizationHandler
 from mcp.server.auth.provider import (
     AccessToken,
@@ -987,6 +988,16 @@ mcp_app = mcp.streamable_http_app(
     streamable_http_path="/mcp",
     stateless_http=True,
     host="127.0.0.1",
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=[
+            "debian-novnc-2-bf1b014a-tz6gym.cranl.net",
+            "debian-novnc-2-bf1b014a-tz6gym.cranl.net:*",
+        ],
+        allowed_origins=[
+            "https://debian-novnc-2-bf1b014a-tz6gym.cranl.net",
+            "https://debian-novnc-2-bf1b014a-tz6gym.cranl.net:*",
+        ],
+    ),
 )
 mcp_app.router.routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
