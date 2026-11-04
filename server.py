@@ -41,6 +41,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.server.auth.settings import AuthSettings
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from radius_panel import routes as radius_panel_routes
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1001,7 @@ mcp_app = mcp.streamable_http_app(
     ),
 )
 mcp_app.router.routes = [
+    *radius_panel_routes,
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
     Route("/authorize", AuthorizationHandler(provider).handle, methods=["GET", "POST"]),
     Route("/token", token_endpoint, methods=["POST"]),
