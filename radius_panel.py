@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -229,6 +230,11 @@ async def api_create_user(request: Request) -> Response:
         if not 8 <= len(password) <= 128:
             return _json({"error": "كلمة المرور يجب أن تكون بين 8 و128 حرفًا"}, 400)
         plan_id = int(body["plan_id"]) if body.get("plan_id") else None
+        expires_at = None
+        if body.get("expires_at"):
+            expires_at = datetime.fromisoformat(str(body["expires_at"]).replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                raise ValueError("تاريخ انتهاء الاشتراك يجب أن يتضمن المنطقة الزمنية")
         pool = await _db()
         async with pool.acquire() as con:
             async with con.transaction():
@@ -240,12 +246,17 @@ async def api_create_user(request: Request) -> Response:
                       email=EXCLUDED.email, plan_id=EXCLUDED.plan_id,
                       expires_at=EXCLUDED.expires_at, enabled=true, updated_at=now()
                 """, username, str(body.get("display_name") or ""), str(body.get("phone") or ""),
-                     str(body.get("email") or ""), plan_id, body.get("expires_at") or None)
-                await con.execute("DELETE FROM radius.radcheck WHERE username=$1 AND attribute IN ('Cleartext-Password','Auth-Type')", username)
+                     str(body.get("email") or ""), plan_id, expires_at)
+                await con.execute("DELETE FROM radius.radcheck WHERE username=$1 AND attribute IN ('Cleartext-Password','Auth-Type','Expiration')", username)
                 await con.execute(
                     "INSERT INTO radius.radcheck(username,attribute,op,value) VALUES($1,'Cleartext-Password',':=',$2)",
                     username, password
                 )
+                if expires_at:
+                    await con.execute(
+                        "INSERT INTO radius.radcheck(username,attribute,op,value) SELECT $1,'Expiration',':=',to_char($2::timestamptz,'DD Mon YYYY HH24:MI:SS')",
+                        username, expires_at
+                    )
                 if plan_id:
                     await _apply_plan(con, username, plan_id)
                 await con.execute(
