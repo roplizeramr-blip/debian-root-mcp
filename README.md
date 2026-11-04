@@ -1,29 +1,41 @@
-# Debian Root MCP
+# Debian noVNC + FreeRADIUS MCP
 
-Authenticated MCP server for managing the Debian container that also hosts noVNC and FreeRADIUS.
+OAuth-protected MCP administration for the existing Debian/noVNC container.
 
-## Features
-- MCP over Streamable HTTP at `/mcp`
-- Mandatory Bearer-token authentication (no default credentials)
-- Root-level shell, file, package, service and system inspection tools
-- Existing noVNC web UI remains available at `/`
-- FreeRADIUS + PostgreSQL driver installed in the image
+## Authentication
+- Supabase Auth is the OAuth 2.1 authorization server.
+- FastMCP SupabaseProvider verifies Supabase JWTs and publishes MCP protected-resource metadata.
+- Authorization Code + PKCE and refresh tokens are handled by Supabase Auth.
+- Consent UI: `/oauth/callback`. No static MCP bearer token is used.
 
-## Required environment variable
-Set `MCP_AUTH_TOKEN` to a cryptographically random secret of at least 32 characters in the deployment platform's secret/environment settings. Never commit it or put it in browser code.
+## Required environment
+- `SUPABASE_PROJECT_URL=https://wloqbuigxcbcxprmnyjq.supabase.co`
+- `MCP_BASE_URL=https://YOUR-APP-DOMAIN`
+- `SUPABASE_JWT_ALGORITHM=ES256` (must match Supabase Auth signing key)
 
-## MCP connection
-- URL: `https://YOUR-APP-DOMAIN/mcp`
-- Transport: Streamable HTTP
-- Header: `Authorization: Bearer YOUR_MCP_AUTH_TOKEN`
+The publishable key is public and embedded in `oauth-consent.html`. Never put a Supabase secret/service-role key in browser code.
 
-The `/health` endpoint is intentionally unauthenticated and exposes only a basic liveness response. All MCP requests require the bearer token.
+## Supabase Dashboard setup
+1. Authentication → OAuth Server → enable OAuth Server.
+2. Enable Dynamic OAuth Apps / Dynamic Client Registration.
+3. Set Site URL to `https://YOUR-APP-DOMAIN`.
+4. Set Authorization Path to `/oauth/callback`.
+5. Use an asymmetric JWT signing key (ES256 or RS256) and set the matching algorithm.
+6. Create the owner account under Authentication → Users, then disable public sign-ups. Consent UI supports sign-in only.
+7. Verify discovery at `https://wloqbuigxcbcxprmnyjq.supabase.co/.well-known/oauth-authorization-server/auth/v1`.
 
-## Docker
-```sh
-docker build -t debian-root-mcp .
-docker run --rm -p 6901:6901 -e MCP_AUTH_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" debian-root-mcp
-```
+## MCP endpoint
+`https://YOUR-APP-DOMAIN/mcp`. Add as a custom MCP server in ChatGPT and choose OAuth.
 
-## Security
-This server intentionally exposes a root command-execution tool. Anyone holding the bearer token can fully control the container. Use a unique secret, store it only as a platform secret, rotate it if exposed, and do not reuse it elsewhere. Container root is not automatically host root; Docker socket access is not mounted by this project.
+## Tools
+- `system_overview`
+- `service_status`, `service_control` (FreeRADIUS and Nginx only)
+- `freeradius_config_test`, `nginx_config_test`
+- `list_config_files`, `read_config_file`, `write_config_file`
+- `read_service_logs`
+
+Writes are limited to .conf files in `/etc/freeradius/3.0` and `/etc/nginx/conf.d`, atomic, size-limited and backed up once. There is no arbitrary shell execution, unrestricted file write, or Docker socket access.
+
+Audit records contain metadata only at `/var/log/debian-root-mcp/audit.jsonl`; tokens and config contents are never logged.
+
+noVNC remains at `/`; MCP uses `/mcp`; OAuth consent uses `/oauth/callback`. Nginx listens on 6901.
