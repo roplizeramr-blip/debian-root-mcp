@@ -43,7 +43,6 @@ def main() -> int:
         "password=" + pg_quote(password),
         "sslmode='require'",
         "application_name='FreeRADIUS'",
-        "options='-c search_path=radius,public'",
     ])
 
     module = BASE / "mods-available/sql"
