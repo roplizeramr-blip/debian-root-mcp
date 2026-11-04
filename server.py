@@ -52,7 +52,7 @@ if not BASE_URL.startswith("https://"):
     raise RuntimeError("MCP_BASE_URL must be a public HTTPS URL")
 
 ISSUER = BASE_URL + "/"
-RESOURCE = BASE_URL  # ChatGPT's canonical MCP resource URI is the origin, not the transport path.
+RESOURCE = BASE_URL + "/"  # Match the canonical origin URI emitted by AnyHttpUrl in protected-resource metadata.
 AUTHORIZATION_ENDPOINT = BASE_URL + "/authorize"
 TOKEN_ENDPOINT = BASE_URL + "/token"
 ADMIN_USERNAME = os.environ["MCP_ADMIN_USERNAME"]
