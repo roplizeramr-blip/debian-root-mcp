@@ -19,7 +19,6 @@ RUN python3 -m venv /opt/debian-root-mcp/.venv \
     && /opt/debian-root-mcp/.venv/bin/pip install --no-cache-dir -r requirements.txt
 
 COPY server.py /opt/debian-root-mcp/server.py
-COPY oauth-consent.html /opt/debian-root-mcp/oauth-consent.html
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY start-with-radius.sh /usr/local/bin/start-with-radius.sh
 RUN chmod 0755 /usr/local/bin/start-with-radius.sh
