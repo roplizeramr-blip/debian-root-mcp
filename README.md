@@ -51,3 +51,18 @@ These privileges apply to the Debian container only, not the hosting provider's 
 Metadata-only audit events are written to `/var/log/debian-root-mcp/audit.jsonl`. Passwords, bearer tokens, and file contents are not written to the audit log. MCP listens on loopback port 8765 behind Nginx on port 6901; noVNC remains on its original internal port 6902.
 
 The MCP server uses in-memory authorization transactions and revocation state. A container redeploy or restart may require the user to authorize again; do not assume in-memory revocation state survives a restart.
+
+
+## RADIUS administration panel
+
+The web dashboard is served at `/radius/` on the same HTTPS app domain. It reuses the MCP administrator username and PBKDF2 password hash for login, then provides subscriber, plan, NAS, session, and authentication-log screens.
+
+### Supabase PostgreSQL
+
+Create/use the private `radius` schema in Supabase and a dedicated login role named `radius_runtime`. The application reads a full PostgreSQL URI from the CranL environment variable `SUPABASE_DATABASE_URL`. Use the Supabase **Connect → Session pooler** URI (port **5432**, not transaction mode), and the custom-role username format `radius_runtime.<project-ref>`. The URI must include TLS; the app enforces `sslmode=require`. Do not commit this URI to Git or paste it into logs.
+
+The startup configurator enables FreeRADIUS SQL authorization/accounting and reads NAS clients from the `radius.nas` table. New NAS client entries are loaded when FreeRADIUS starts, so restart/redeploy after changing NAS clients. PAP/CHAP passwords are not written into `radpostauth`.
+
+### Runtime limits and networking
+
+The panel and FreeRADIUS SQL pools are tuned for a small container (one to three PostgreSQL connections for the panel and up to three for FreeRADIUS). The container image declares RADIUS UDP ports 1812/1813, but Docker `EXPOSE` alone does not publish them; the hosting platform must provide public UDP ingress before external MikroTik/NAS devices can reach this instance. Until then, use local `radtest` checks only and do not point production NAS devices at the public HTTP URL.
