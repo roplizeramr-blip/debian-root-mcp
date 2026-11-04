@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 : "${MCP_BASE_URL:?MCP_BASE_URL is required}"
 : "${MCP_ADMIN_USERNAME:?MCP_ADMIN_USERNAME is required}"
@@ -12,13 +12,38 @@ cd /opt/debian-root-mcp
 /opt/debian-root-mcp/.venv/bin/python /opt/debian-root-mcp/server.py &
 MCP_PID=$!
 
-if [ -n "${SUPABASE_DATABASE_URL:-}" ]; then
-    /opt/debian-root-mcp/.venv/bin/python /opt/debian-root-mcp/configure_radius.py
-    freeradius -XC
-    freeradius -f &
+nginx
+
+RADIUS_PID=""
+if [[ -n "${RADIUS_API_URL:-}" && -n "${RADIUS_API_KEY:-}" ]]; then
+    if /opt/debian-root-mcp/.venv/bin/python /opt/debian-root-mcp/configure_radius.py && freeradius -XC; then
+        freeradius -f &
+        RADIUS_PID=$!
+        echo "FreeRADIUS started with Supabase-backed REST authentication."
+    else
+        echo "FreeRADIUS configuration failed; web panel and MCP remain available." >&2
+    fi
 else
-    echo "SUPABASE_DATABASE_URL is not configured; FreeRADIUS will stay disabled."
+    echo "RADIUS_API_URL/RADIUS_API_KEY not configured; FreeRADIUS remains disabled."
 fi
 
-nginx
-exec /dockerstartup/startup.sh
+/dockerstartup/startup.sh &
+DESKTOP_PID=$!
+
+PIDS=("$MCP_PID" "$DESKTOP_PID")
+if [[ -n "$RADIUS_PID" ]]; then
+    PIDS+=("$RADIUS_PID")
+fi
+
+cleanup() {
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM
+
+set +e
+wait -n "${PIDS[@]}"
+STATUS=$?
+set -e
+exit "$STATUS"
