@@ -175,6 +175,7 @@ CALLBACK_PATH_PATTERN = re.compile(r"^/connector/oauth/[A-Za-z0-9_-]{1,80}$")
 CLIENT_CACHE: dict[str, tuple[float, OAuthClientInformationFull, dict[str, Any]]] = {}
 CLIENT_ASSERTION_JTIS: dict[str, float] = {}
 REVOKED_REFRESH_JTIS: set[str] = set()
+REVOKED_ACCESS_JTIS: set[str] = set()
 
 
 def allowed_chatgpt_redirect(uri: str) -> bool:
@@ -348,7 +349,7 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         claims = decode_signed_token(token, "access")
-        if not claims:
+        if not claims or claims.get("jti") in REVOKED_ACCESS_JTIS:
             return None
         scopes = str(claims["scope"]).split()
         if SCOPE_ADMIN not in scopes:
@@ -367,7 +368,10 @@ class LocalOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Ref
         for token_type in ("refresh", "access"):
             claims = decode_signed_token(token, token_type)
             if claims:
-                REVOKED_REFRESH_JTIS.add(str(claims["jti"]))
+                if token_type == "refresh":
+                    REVOKED_REFRESH_JTIS.add(str(claims["jti"]))
+                else:
+                    REVOKED_ACCESS_JTIS.add(str(claims["jti"]))
                 return
 
 
@@ -434,7 +438,7 @@ async def verify_client_assertion(client_id: str, form: Any) -> bool:
         )
         aud = claims.get("aud")
         audiences = aud if isinstance(aud, list) else [aud]
-        if client_id not in (claims.get("iss"), claims.get("sub")):
+        if claims.get("iss") != client_id or claims.get("sub") != client_id:
             return False
         if TOKEN_ENDPOINT not in audiences:
             return False
@@ -557,7 +561,10 @@ async def revocation_endpoint(request: Request) -> Response:
             for kind in ("refresh", "access"):
                 claims = decode_signed_token(token, kind)
                 if claims:
-                    REVOKED_REFRESH_JTIS.add(str(claims["jti"]))
+                    if kind == "refresh":
+                        REVOKED_REFRESH_JTIS.add(str(claims["jti"]))
+                    else:
+                        REVOKED_ACCESS_JTIS.add(str(claims["jti"]))
                     break
         return JSONResponse({}, headers={"Cache-Control": "no-store"})
     except Exception:
