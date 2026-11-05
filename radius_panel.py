@@ -17,7 +17,8 @@ import httpx
 import jwt
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 ADMIN_USERNAME = os.environ.get("MCP_ADMIN_USERNAME", "")
 ADMIN_PASSWORD_HASH = os.environ.get("MCP_ADMIN_PASSWORD_HASH", "")
@@ -26,6 +27,7 @@ RADIUS_API_URL = os.environ.get("RADIUS_API_URL", "")
 RADIUS_API_KEY = os.environ.get("RADIUS_API_KEY", "")
 COOKIE_NAME = "radius_panel_session"
 CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0), limits=httpx.Limits(max_connections=12, max_keepalive_connections=6))
+ASSET_DIR = Path(__file__).resolve().parent / "static" / "tabler"
 
 
 def _json(data: Any, status: int = 200) -> JSONResponse:
@@ -177,7 +179,25 @@ async def dashboard(request: Request) -> Response:
 
 
 async def api_health(request: Request) -> Response:
-    return await _proxy(request, "health", roles=("super_admin", "network_owner", "reseller", "support"))
+    response = await _proxy(request, "health", roles=("super_admin", "network_owner", "reseller", "support"))
+    if response.status_code >= 400:
+        return response
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+        process = subprocess.run(["pgrep", "-x", "freeradius"], capture_output=True, text=True, timeout=3, check=False)
+        sockets = subprocess.run(["ss", "-H", "-lun"], capture_output=True, text=True, timeout=3, check=False)
+        listeners = sockets.stdout if sockets.returncode == 0 else ""
+        payload.update({
+            "freeradius_running": process.returncode == 0,
+            "auth_udp_listening": ":1812" in listeners,
+            "accounting_udp_listening": ":1813" in listeners,
+        })
+        payload["radius_ready"] = bool(
+            payload["freeradius_running"] and payload["auth_udp_listening"] and payload["accounting_udp_listening"]
+        )
+        return _json(payload)
+    except Exception:
+        return response
 
 
 async def api_overview(request: Request) -> Response:
@@ -690,4 +710,5 @@ routes = [
     Route("/radius/api/notifications", api_notifications, methods=["GET"]),
     Route("/radius/api/audit", api_audit, methods=["GET"]),
     Route("/radius/api/wireguard/peers", api_wireguard, methods=["GET"]),
+    Mount("/radius/assets", app=StaticFiles(directory=str(ASSET_DIR)), name="radius-assets"),
 ]
